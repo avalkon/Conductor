@@ -1,3 +1,9 @@
+<p align="center">
+<a href="https://github.com/avalkon/Conductor/releases"><img src="https://img.shields.io/github/downloads/avalkon/Conductor/total?label=Downloads" alt="Downloads" /></a>
+ <img src="https://img.shields.io/badge/Windows-supported-0078D6?logo=windows&logoColor=white" alt="Windows" />
+  <img src="https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=white" alt="Linux" />
+</p>
+
 # LOTRO Conductor v0.12.5
 
 Conductor is a LotRO plug-beside intended for use in conjunction with SongBook3. SongBook3 versions 1.25.5 and up are ready-to-use with Conductor. Should be linux+windows compatible, but only tested in linux so far, specifically in x11. Wayland needs testing and development, and I don't have any machines using it. Windows testing to come.
