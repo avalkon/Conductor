@@ -6,7 +6,7 @@
 
 # LOTRO Conductor v0.12.5
 
-Conductor is a LotRO plug-beside intended for use in conjunction with SongBook3. SongBook3 versions 1.25.5 and up are ready-to-use with Conductor. Should be linux+windows compatible, but only tested in linux so far, specifically in x11. Wayland needs testing and development, and I don't have any machines using it. Windows testing to come.
+Conductor is a LotRO plug-beside intended for use in conjunction with SongBook3. SongBook3 versions 1.25.5 and up are ready-to-use with Conductor. Should be linux+windows compatible, but only tested in linux so far, specifically in x11. Wayland needs testing and development, and I don't have any machines using it. Windows testing has confirmed the local mode works fine. Networked testing to come.
 
 Two or more different characters may now intentionally share the same ABC `X:` part. In previous versions, **Sync All** and **Show in SongBook** aborted with `Two or more characters are assigned the same X: track ID`.
 
