@@ -403,7 +403,13 @@ public final class LocalAgent implements AutoCloseable {
         for (String command : commands) {
             if (command.length() > 350) throw new IOException("Command line too long");
             logger.accept((live ? "SENDING " : "DRY-RUN ") + b.character() + " => " + command);
-            if (live) backend.sendChat(b.window(), command);
+            if (live) {
+                backend.sendChat(b.window(), command);
+                // This marker (and the later RESULT sent to the host) occurs only
+                // after the local backend's per-command post-submit settling barrier.
+                // It does not claim that LOTRO accepted the command.
+                logger.accept("CHAT INPUT SETTLED " + b.character() + " => " + kind);
+            }
             if (commands.size() > 1 && command != commands.get(commands.size()-1)) Thread.sleep(270);
         }
         if (kind.equals("REPORT") && live && b.statusFile() != null) {

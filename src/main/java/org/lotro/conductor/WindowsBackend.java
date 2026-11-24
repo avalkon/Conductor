@@ -5,6 +5,8 @@ import java.util.*;
 
 /** Windows developer backend: per-client PID enumeration; focus via Windows Shell AppActivate. */
 public final class WindowsBackend implements GameBackend {
+    private volatile ChatInputTiming chatTiming = ChatInputTiming.DEFAULT;
+    @Override public void setChatTiming(ChatInputTiming timing) { chatTiming = Objects.requireNonNull(timing); }
     @Override public List<GameWindow> listWindows() throws Exception {
         String ps = "Get-Process | Where-Object { $_.ProcessName -match '^lotroclient' -and $_.MainWindowHandle -ne 0 } | ForEach-Object { [string]$_.Id + '|' + $_.MainWindowTitle }";
         String raw = ProcessTools.run(12, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps);
@@ -25,7 +27,7 @@ public final class WindowsBackend implements GameBackend {
     }
     @Override public void sendChat(GameWindow window, String command) throws Exception {
         focusWindow(window);
-        KeyTyper.command(command);
+        KeyTyper.command(command, chatTiming);
     }
     @Override public void sendShortcut(GameWindow window, Shortcut shortcut) throws Exception {
         if (!isValidWindow(window)) throw new IOException("Registered LOTRO window is no longer available");

@@ -35,6 +35,8 @@ public final class Main {
             BandServer server = options.host() ? new BandServer(options.port(), options.key(), options.local()) : null;
             if (server != null) server.start();
             ProfileStore profiles = new ProfileStore(options.profilesPath());
+            // Each computer controls its own input speed. No new network protocol needed.
+            backend.setChatTiming(new SettingsStore(profiles.path().resolveSibling("settings.properties")).chatTiming());
             LocalAgent agent = new LocalAgent(backend, options.musicDir(), options.live() && !options.demo(),
                     message -> { System.out.println(message); ConductorFrame frame = ref.get(); if (frame != null) frame.log(message); }, profiles);
             BandClient client;

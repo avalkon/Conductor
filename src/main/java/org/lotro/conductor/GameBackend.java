@@ -16,6 +16,8 @@ public interface GameBackend {
     default void sendShortcut(GameWindow window, Shortcut shortcut) throws Exception {
         throw new UnsupportedOperationException("Quickslot input is unsupported by this backend");
     }
+    /** Local desktop input timing; agents never transmit this setting across the LAN. */
+    default void setChatTiming(ChatInputTiming timing) { }
     void sendChat(GameWindow window, String command) throws Exception;
     String description();
 }

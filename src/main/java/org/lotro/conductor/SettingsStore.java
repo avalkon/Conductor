@@ -25,6 +25,7 @@ public final class SettingsStore {
     private String songBookLibraryFile = "";
     private SongDisplayFormat songDisplayFormat = SongDisplayFormat.PARTS_TITLE_ARTIST_TIME;
     private int identifyWaitSeconds = 120;
+    private ChatInputTiming chatTiming = ChatInputTiming.DEFAULT;
 
     public SettingsStore(Path file) throws IOException {
         this.file = file.toAbsolutePath().normalize();
@@ -58,9 +59,23 @@ public final class SettingsStore {
             try { identifyWaitSeconds = Integer.parseInt(props.getProperty("identifyWaitSeconds", "120")); }
             catch (NumberFormatException ignored) { identifyWaitSeconds = 120; }
             if (identifyWaitSeconds < 15 || identifyWaitSeconds > 600) identifyWaitSeconds = 120;
+            try {
+                chatTiming = new ChatInputTiming(
+                    Integer.parseInt(props.getProperty("chatOpenMs", "300")),
+                    Integer.parseInt(props.getProperty("chatKeyDelayMs", "45")),
+                    Integer.parseInt(props.getProperty("chatBeforeEnterMs", "220")),
+                    Integer.parseInt(props.getProperty("chatAfterEnterMs", "550")),
+                    Integer.parseInt(props.getProperty("chatAfterEnterPerCharacterMs", "0")));
+            } catch (IllegalArgumentException ignored) { chatTiming = ChatInputTiming.DEFAULT; }
         }
     }
     public Path path() { return file; }
+    public ChatInputTiming chatTiming() { return chatTiming; }
+    public void setChatTiming(ChatInputTiming value) throws IOException {
+        ChatInputTiming previous = chatTiming;
+        chatTiming = java.util.Objects.requireNonNull(value);
+        try { save(); } catch(IOException e) { chatTiming = previous; throw e; }
+    }
     public boolean confirmActions() { return confirmActions; }
     public boolean autoAcceptMatches() { return autoAcceptMatches; }
     public void setConfirmActions(boolean value) throws IOException { confirmActions = value; save(); }
@@ -150,6 +165,11 @@ public final class SettingsStore {
         p.setProperty("songBookLibraryFile", songBookLibraryFile);
         p.setProperty("songDisplayFormat",songDisplayFormat.name());
         p.setProperty("identifyWaitSeconds", Integer.toString(identifyWaitSeconds));
+        p.setProperty("chatOpenMs", Integer.toString(chatTiming.chatOpenMs()));
+        p.setProperty("chatKeyDelayMs", Integer.toString(chatTiming.keyDelayMs()));
+        p.setProperty("chatBeforeEnterMs", Integer.toString(chatTiming.beforeEnterMs()));
+        p.setProperty("chatAfterEnterMs", Integer.toString(chatTiming.afterEnterMs()));
+        p.setProperty("chatAfterEnterPerCharacterMs", Integer.toString(chatTiming.afterEnterPerCharacterMs()));
         Path tmp = Files.createTempFile(file.getParent(), "settings-", ".tmp");
         try {
             try (OutputStream out = Files.newOutputStream(tmp)) { p.store(out, "LOTRO Conductor preferences"); }

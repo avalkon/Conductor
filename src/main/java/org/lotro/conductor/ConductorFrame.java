@@ -116,10 +116,11 @@ public final class ConductorFrame extends JFrame {
         Thread t = new Thread(r,"conductor-ui-worker"); t.setDaemon(true); return t;
     });
     public ConductorFrame(Options options, GameBackend backend, LocalAgent agent, BandClient client, BandServer server, ProfileStore profiles) {
-        super("LOTRO Conductor 0.12.5 — " + options.nodeName() + (options.local() ? " [LOCAL]" : options.host() ? " [HOST]" : " [AGENT]"));
+        super("LOTRO Conductor 0.12.7 — " + options.nodeName() + (options.local() ? " [LOCAL]" : options.host() ? " [HOST]" : " [AGENT]"));
         this.options = options; this.backend = backend; this.agent = agent; this.client = client; this.server = server; this.profiles = profiles;
         try { this.settings = new SettingsStore(profiles.path().resolveSibling("settings.properties")); }
         catch (IOException e) { throw new IllegalStateException("Cannot load Conductor settings: " + e.getMessage(), e); }
+        backend.setChatTiming(settings.chatTiming());
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         addWindowListener(new WindowAdapter() {
             @Override public void windowClosing(WindowEvent e) { shutdown(); }
@@ -605,6 +606,40 @@ public final class ConductorFrame extends JFrame {
             checkLabels.put(check,check.getText());
             addSettingLine(controls,check);
         }
+        // Per-machine pacing, applied immediately to the local input backend.
+        // Keep compact so the Settings tab stays usable at narrow widths.
+        JPanel timingPanel = new JPanel(new GridLayout(5, 2, 5, 2));
+        timingPanel.setBorder(BorderFactory.createTitledBorder("Chat typing timing (this computer, milliseconds)"));
+        ChatInputTiming timing = settings.chatTiming();
+        JSpinner openWait = new JSpinner(new SpinnerNumberModel(timing.chatOpenMs(), 0, 5000, 50));
+        JSpinner keyWait = new JSpinner(new SpinnerNumberModel(timing.keyDelayMs(), 0, 200, 5));
+        JSpinner beforeWait = new JSpinner(new SpinnerNumberModel(timing.beforeEnterMs(), 0, 5000, 50));
+        JSpinner afterWait = new JSpinner(new SpinnerNumberModel(timing.afterEnterMs(), 0, 5000, 50));
+        JSpinner perCharacterWait = new JSpinner(new SpinnerNumberModel(timing.afterEnterPerCharacterMs(), 0, 100, 5));
+        String[] timingNames = {"After opening chat", "Between typed keys", "Before sending Enter",
+                "Min. before next window", "Extra ms per typed char"};
+        JSpinner[] timingInputs = {openWait, keyWait, beforeWait, afterWait, perCharacterWait};
+        for (int i=0;i<timingInputs.length;i++) {
+            timingPanel.add(new JLabel(timingNames[i]));
+            timingPanel.add(timingInputs[i]);
+        }
+        javax.swing.event.ChangeListener pacingChanged = event -> {
+            try {
+                ChatInputTiming next = new ChatInputTiming((Integer)openWait.getValue(),(Integer)keyWait.getValue(),
+                        (Integer)beforeWait.getValue(),(Integer)afterWait.getValue(),
+                        (Integer)perCharacterWait.getValue());
+                settings.setChatTiming(next);
+                backend.setChatTiming(next);
+                log("Local chat typing delays saved: " + next);
+            } catch(Exception ex) { error("Cannot save chat timing: " + ex.getMessage()); }
+        };
+        for(JSpinner input:timingInputs) input.addChangeListener(pacingChanged);
+        addSettingLine(controls,timingPanel);
+        JLabel timingNote=new JLabel();
+        timingNote.setFont(timingNote.getFont().deriveFont(Font.PLAIN,11f));
+        timingNote.setForeground(Color.GRAY);
+        noteLabels.put(timingNote,"After Enter, Conductor waits minimum + (typed characters × extra ms). Example: 100 ms + 20 characters × 15 ms = 400 ms. Maximum 60 seconds. Local per PC; sent is not game-confirmed.");
+        addSettingLine(controls,timingNote);
         JButton resetEquipHistory = new JButton("Reset remembered Equip shortcuts (all computers)");
         resetEquipHistory.setToolTipText("Clear each agent's last successful Equip command. Next Equip can send the shortcut again.");
         resetEquipHistory.setEnabled(options.host());

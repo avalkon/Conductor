@@ -6,11 +6,15 @@ import java.awt.event.KeyEvent;
 /** ASCII-only keyboard typing via AWT. Assumes US-layout key positions in this prototype. */
 final class KeyTyper {
     private KeyTyper() { }
-    static void command(String line) throws AWTException {
-        Robot r = new Robot(); r.setAutoDelay(13);
+    static void command(String line, ChatInputTiming timing) throws AWTException, InterruptedException {
+        Robot r = new Robot();
+        r.setAutoDelay(timing.keyDelayMs());
         tap(r, KeyEvent.VK_ENTER);
+        Thread.sleep(timing.chatOpenMs());
         for (char c : line.toCharArray()) type(r, c);
+        Thread.sleep(timing.beforeEnterMs());
         tap(r, KeyEvent.VK_ENTER);
+        Thread.sleep(timing.afterEnterDelayMs(line));
     }
     private static void tap(Robot r, int code) { r.keyPress(code); r.keyRelease(code); }
     private static void type(Robot r, char c) {

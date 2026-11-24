@@ -30,6 +30,7 @@ public final class DevTests {
         profilesAndMatching();
         settingsAndWatcher();
         x11WindowRaceAndGuard();
+        slowChatTypingBarriers();
         networkAndCommands();
         distributedCapabilitiesAndInput();
         localAgentPipeline();
@@ -1054,6 +1055,99 @@ public final class DevTests {
         expectFailure(() -> wrongFocus.focusWindow(found.get(0)),
                 "Identify/focus-only action must also fail closed on wrong window");
         checks++;
+    }
+
+    /** Slow-clients: do not refocus the next LOTRO window until chat has opened,
+     * all text is emitted, Return is sent, and the post-submit barrier elapsed.
+     * These are testable delivery barriers, not claims about in-game acknowledgement.
+     */
+    private static void slowChatTypingBarriers() throws Exception {
+        Path dir=Files.createTempDirectory("conductor-pacing-");
+        try {
+            SettingsStore prefs=new SettingsStore(dir.resolve("settings.properties"));
+            check(prefs.chatTiming().equals(ChatInputTiming.DEFAULT), "Default chat pacing exists");
+            ChatInputTiming timing=new ChatInputTiming(30, 65, 25, 140);
+            prefs.setChatTiming(timing);
+            check(new SettingsStore(prefs.path()).chatTiming().equals(timing),
+                    "Each machine persists input pacing independently");
+            // v0.12.6 four-value settings stay valid; a per-character component is opt-in.
+            check(timing.afterEnterPerCharacterMs() == 0 && timing.afterEnterDelayMs("/long path") == 140,
+                    "Legacy four-argument pacing preserves the original fixed after-Enter wait");
+            ChatInputTiming adaptive = new ChatInputTiming(30, 65, 25, 100, 15);
+            check(adaptive.afterEnterDelayMs("/x") == 130,
+                    "Short command gets the minimum plus two characters");
+            check(adaptive.afterEnterDelayMs("/play song sync") == 100 + 15 * 15,
+                    "Spaces and slash characters count toward the delay");
+            check(adaptive.afterEnterDelayMs("a\uD83D\uDC9Ab") == 145,
+                    "Delay counts Unicode code points rather than UTF-16 storage units");
+            check(new ChatInputTiming(0, 0, 0, 100, 100).afterEnterDelayMs("a".repeat(1000))
+                    == ChatInputTiming.MAX_SETTLE_MS, "Unusually long commands cannot block the queue indefinitely");
+            prefs.setChatTiming(adaptive);
+            check(new SettingsStore(prefs.path()).chatTiming().equals(adaptive),
+                    "Adaptive per-character input timing persists on this computer");
+            // A pre-upgrade settings file lacks the new key; it must default to no extra delay.
+            Files.writeString(prefs.path(), "chatOpenMs=300\nchatKeyDelayMs=45\nchatBeforeEnterMs=220\nchatAfterEnterMs=550\n");
+            check(new SettingsStore(prefs.path()).chatTiming().equals(ChatInputTiming.DEFAULT),
+                    "Existing v0.12.6 settings load without migration");
+            expectFailure(() -> new ChatInputTiming(0, 20, 20, 20, 101),
+                    "Out-of-range per-character settling delay rejected");
+            expectFailure(() -> new ChatInputTiming(-1, 20, 20, 20), "Negative chat-open delay rejected");
+            expectFailure(() -> new ChatInputTiming(0, 201, 20, 20), "Overlarge character delay rejected");
+            check(new ChatInputTiming(300, 120, 220, 500).typeTimeoutSeconds(350) >= 42,
+                    "Long typed commands get a proportional process timeout");
+            java.util.concurrent.atomic.AtomicLong focused=new java.util.concurrent.atomic.AtomicLong(0);
+            java.util.List<String> operations=new java.util.concurrent.CopyOnWriteArrayList<>();
+            java.util.List<Long> milliseconds=new java.util.concurrent.CopyOnWriteArrayList<>();
+            X11Backend backend=new X11Backend((timeout, args) -> {
+                if(args[0].equals("wmctrl") && args[1].equals("-ia")) {
+                    focused.set(Long.parseUnsignedLong(args[2].substring(2),16));
+                    operations.add("FOCUS:"+args[2]); milliseconds.add(System.nanoTime());
+                } else if(args[0].equals("xdotool") && args[1].equals("getactivewindow")) {
+                    return new ProcessTools.Result(0,Long.toUnsignedString(focused.get())+"\n");
+                } else if(args[0].equals("xdotool") && args[1].equals("getwindowname")) {
+                    return new ProcessTools.Result(0,"The Lord of the Rings Online™\n");
+                } else if(args[0].equals("xdotool") && args[1].equals("key")) {
+                    operations.add("ENTER:"+focused.get()); milliseconds.add(System.nanoTime());
+                } else if(args[0].equals("xdotool") && args[1].equals("type")) {
+                    operations.add("TYPE:"+focused.get()+":"+args[4]+":"+args[6]); milliseconds.add(System.nanoTime());
+                    if(!args[5].equals("--")) throw new AssertionError("Unrecognized xdotool argument order");
+                } else throw new AssertionError("Unexpected x11 subprocess: "+String.join(" ",args));
+                return new ProcessTools.Result(0,"");
+            });
+            backend.setChatTiming(timing);
+            GameWindow first=new GameWindow("0x00000101","The Lord of the Rings Online™");
+            GameWindow second=new GameWindow("0x00000102","The Lord of the Rings Online™");
+            backend.sendChat(first,"/music");
+            backend.sendChat(second,"/playstart");
+            check(operations.equals(java.util.List.of(
+                    "FOCUS:0x00000101","ENTER:257","TYPE:257:65:/music","ENTER:257",
+                    "FOCUS:0x00000102","ENTER:258","TYPE:258:65:/playstart","ENTER:258")),
+                    "X11 typed commands and Return events stay bound to the intended window, in order");
+            long lastEnterFirst=milliseconds.get(3); // last Return for first character
+            long nextFocus=milliseconds.get(4);
+            check(nextFocus-lastEnterFirst >= 110_000_000L,
+                    "Input call remains active after final Enter before next window can focus");
+            // Test the real X11 backend with a short command then a much longer one.
+            // All commands are injected via a mock runner; no live desktop input occurs.
+            ChatInputTiming adaptiveWait = new ChatInputTiming(0, 0, 0, 25, 12);
+            backend.setChatTiming(adaptiveWait);
+            int index = milliseconds.size();
+            backend.sendChat(first, "/x");
+            backend.sendChat(second, "/play a long song sync");
+            backend.sendChat(first, "/z");
+            long shortDelayNs = milliseconds.get(index+4) - milliseconds.get(index+3);
+            long longDelayNs = milliseconds.get(index+8) - milliseconds.get(index+7);
+            check(shortDelayNs >= 40_000_000L,
+                    "Short command settles proportionally before next window gets focus");
+            check(longDelayNs >= 260_000_000L,
+                    "Long command waits longer before allowing the next LOTRO window focus");
+        } finally {
+            try(var paths=Files.walk(dir)) {
+                paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+                    try {Files.deleteIfExists(path);} catch(Exception ignored) { }
+                });
+            }
+        }
     }
 
     private static void networkAndCommands() throws Exception {

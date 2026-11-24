@@ -10,6 +10,8 @@ public final class X11Backend implements GameBackend {
     }
 
     private final Runner command;
+    private volatile ChatInputTiming chatTiming = ChatInputTiming.DEFAULT;
+    @Override public void setChatTiming(ChatInputTiming timing) { chatTiming = Objects.requireNonNull(timing); }
     public X11Backend() { this(ProcessTools::result); }
     X11Backend(Runner command) { this.command = command; }
 
@@ -96,14 +98,24 @@ public final class X11Backend implements GameBackend {
     }
 
     @Override public void sendChat(GameWindow window, String text) throws Exception {
+        // The LocalAgent queue serializes windows. Holding this call until after
+        // the settling period prevents later commands from stealing X11 focus
+        // while Wine/LOTRO is still consuming the pending synthetic key events.
+        ChatInputTiming timing = chatTiming;
         long requested = xid(window.id());
         focusWindow(window);
         runChecked(command, 5, "xdotool", "key", "--clearmodifiers", "Return");
+        Thread.sleep(timing.chatOpenMs());
         requireFocus(requested);
-        runChecked(command, 10, "xdotool", "type", "--clearmodifiers", "--delay", "3", "--", text);
-        // Never submit the chat line if focus changed during typing.
+        runChecked(command, timing.typeTimeoutSeconds(text.length()), "xdotool", "type",
+                "--clearmodifiers", "--delay", Integer.toString(timing.keyDelayMs()), "--", text);
+        Thread.sleep(timing.beforeEnterMs());
+        // Never submit the chat line if focus changed during typing or settling.
         requireFocus(requested);
         runChecked(command, 5, "xdotool", "key", "--clearmodifiers", "Return");
+        // xdotool completion means X events were sent, NOT that the game handled them.
+        // Do not release the queue or send RESULT until this barrier has elapsed.
+        Thread.sleep(timing.afterEnterDelayMs(text));
     }
 
     @Override public void sendShortcut(GameWindow window, Shortcut shortcut) throws Exception {

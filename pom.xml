@@ -4,7 +4,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.lotro.community</groupId>
   <artifactId>lotro-conductor</artifactId>
-  <version>0.12.5</version>
+  <version>0.12.7</version>
   <name>LOTRO Conductor (developer preview)</name>
   <description>Lightweight desktop conductor for a distributed LOTRO ABC band</description>
   <properties>
