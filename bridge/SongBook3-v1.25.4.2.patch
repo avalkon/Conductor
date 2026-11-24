@@ -1,0 +1,71 @@
+--- a/Sinduriel/SongBook3/Main.lua
++++ b/Sinduriel/SongBook3/Main.lua
+@@ -52,3 +52,6 @@
+ 
+ Turbine.Shell.AddCommand( "songbook3", songBook3Command );
+ Turbine.Shell.WriteLine("SongBook3 v1.23.2");
++
++-- Conductor 0.4.0 bridge: load after SongBook3 constructs its window.
++import "Sinduriel.SongBook3.ConductorBridge";
+--- a/Sinduriel/SongBook3/Windows/Main/SongBook3Window.lua
++++ b/Sinduriel/SongBook3/Windows/Main/SongBook3Window.lua
+@@ -1059,6 +1059,7 @@
+ 	self:UpdatePlayerTitle();
+ 	
+ 	self.playerEquipment.ItemEquipped = function(sender, args)
++		if type(conductorBridgeOnEquipmentChanged) == "function" then conductorBridgeOnEquipmentChanged(); end
+ 		local insIndex = self:PlayerSyncInfo();
+ 		if insIndex == 0 then return; end
+ 		local trackListEmpty = self.tracklistBox == nil or self.tracklistBox:GetItemCount( ) < 1
+@@ -1079,6 +1080,7 @@
+ --
+ 	
+     self.playerEquipment.ItemUnequipped = function(sender, args)
++        if type(conductorBridgeOnEquipmentChanged) == "function" then conductorBridgeOnEquipmentChanged(); end
+         if not sender:GetItem(Turbine.Gameplay.Equipment.Instrument) then
+             self:SetObservedMusicMode(false);
+         end
+@@ -1920,6 +1922,7 @@
+     self.aCurrentSongReady = {};
+     self.aReadyTracks = "";
+     syncedSongIndex = -1; syncedTrack = -1; PlayerSynced = 0;
++    if type(conductorBridgeOnSyncStateChanged) == "function" then conductorBridgeOnSyncStateChanged(); end;
+     OtherPlayer_SyncedSong_Index = 0; OtherPlayer_SyncedSong_IndexListBox = 0;
+     OtherPlayer_SyncedSong_Filepath = ""; OtherPlayer_SyncedSong_Filename = "";
+     SelectedMatchedSong_Index = 0; SelectedMatchedSong_IndexListBox = 0;
+@@ -3771,6 +3774,7 @@
+ 	end
+ 	
+ 	self:SetTrackColours( selectedTrack );
++    if type(conductorBridgeOnSelectionChanged) == "function" then conductorBridgeOnSelectionChanged(); end
+ end
+ 
+ -- action for setting focus on the track list
+@@ -4390,6 +4394,7 @@
+         -- playback-start signals. Record the current library/setlist song even
+         -- when LOTRO omits a part title from the message.
+         songBook3Window:SongStarted(true, TrackName);
++        if type(conductorBridgeOnPlaybackStarted) == "function" then conductorBridgeOnPlaybackStarted(); end;
+         return;
+     end
+ 
+@@ -4438,6 +4443,7 @@
+ 			PlayerSynced = 1;
+ 			songBook3Window:PlayerSyncInfo();
+             songBook3Window:ArmSyncInfoOnPlaySlot();
++            if type(conductorBridgeOnLocalReady) == "function" then conductorBridgeOnLocalReady(sTrackName); end;
+ 		else
+ 			if songBook3Window.aPlayers[ sPlayerName ] ~= nil then
+ 				
+--- a/Sinduriel/SongBook3/Windows/Main/TimerWindow.lua
++++ b/Sinduriel/SongBook3/Windows/Main/TimerWindow.lua
+@@ -140,7 +140,9 @@
+ -- LOTRO does not document a readable music-mode flag. Track observed
+ -- transitions for this session only; never use this estimate for playback.
+ function MainWindowClass:SetObservedMusicMode(state)
++    local changed = self.timerInMusicMode ~= (state == true);
+     self.timerInMusicMode = state == true;
++    if type(conductorBridgeOnMusicModeChanged) == "function" then conductorBridgeOnMusicModeChanged(); end;
+     if self.TimerMusicModeOnly then self:RefreshTimerWindowVisibility(); end
+ end
+ 

@@ -1,0 +1,15 @@
+{
+  "format": "lotro-conductor-setlist",
+  "version": 1,
+  "name": "Two-player demonstration",
+  "songs": [
+    {
+      "gamePath": "/demo-band",
+      "parts": [
+        {"trackId": 1, "character": "Sinduriel", "instrument": "Basic Lute"},
+        {"trackId": 2, "character": "Arvael", "instrument": "Basic Harp"}
+      ],
+      "unassignedTrackIds": []
+    }
+  ]
+}
