@@ -1,6 +1,6 @@
 <p align="center">
-<a href="https://github.com/avalkon/Conductor/releases"><img src="https://img.shields.io/github/downloads/avalkon/Conductor/total?label=Downloads" alt="Downloads" /></a>
- <img src="https://img.shields.io/badge/Windows-supported-0078D6?logo=windows&logoColor=white" alt="Windows" />
+  <img src="https://img.shields.io/github/downloads/avalkon/Conductor/total?label=Downloads" alt="Downloads" />
+  <img src="https://img.shields.io/badge/Windows-supported-0078D6?logo=windows&logoColor=white" alt="Windows" />
   <img src="https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&logoColor=white" alt="Linux" />
 </p>
 
