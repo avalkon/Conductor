@@ -30,11 +30,28 @@ final class ProcessTools {
         }, "conductor-subprocess-output");
         reader.setDaemon(true);
         reader.start();
-        if (!proc.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
-            proc.destroyForcibly();
-            throw new IOException("Process timed out: " + args[0]);
+        try {
+            if (!proc.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                stopAndWait(proc);
+                throw new IOException("Process timed out: " + args[0]);
+            }
+            reader.join(1000);
+            return new Result(proc.exitValue(), output.toString(StandardCharsets.UTF_8));
+        } catch (InterruptedException e) {
+            // A cancelled xdotool/PowerShell must not keep injecting input after
+            // the next queued game action starts. Do not just abandon the child.
+            stopAndWait(proc);
+            Thread.currentThread().interrupt();
+            throw e;
         }
-        reader.join(1000);
-        return new Result(proc.exitValue(), output.toString(StandardCharsets.UTF_8));
+    }
+    private static void stopAndWait(Process proc) {
+        proc.destroyForcibly();
+        boolean interrupted = false;
+        while (proc.isAlive()) {
+            try { proc.waitFor(); }
+            catch (InterruptedException e) { interrupted = true; }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
     }
 }

@@ -8,6 +8,10 @@ public final class Main {
     public static void main(String[] args) {
         try {
             if (args.length == 1 && args[0].equals("--self-test")) {
+                // AWT clipboard mock tests must not initialize an unavailable X11
+                // display on headless CI or SSH sessions.
+                if (System.getenv("DISPLAY") == null && !System.getProperty("os.name").toLowerCase().contains("windows"))
+                    System.setProperty("java.awt.headless", "true");
                 DevTests.main(new String[0]); return;
             }
             if (args.length == 1 && args[0].equals("--x11-probe")) {
@@ -36,7 +40,9 @@ public final class Main {
             if (server != null) server.start();
             ProfileStore profiles = new ProfileStore(options.profilesPath());
             // Each computer controls its own input speed. No new network protocol needed.
-            backend.setChatTiming(new SettingsStore(profiles.path().resolveSibling("settings.properties")).chatTiming());
+            SettingsStore localPrefs = new SettingsStore(profiles.path().resolveSibling("settings.properties"));
+            backend.setChatTiming(localPrefs.chatTiming());
+            backend.setChatPastePolicy(localPrefs.pastePolicy());
             LocalAgent agent = new LocalAgent(backend, options.musicDir(), options.live() && !options.demo(),
                     message -> { System.out.println(message); ConductorFrame frame = ref.get(); if (frame != null) frame.log(message); }, profiles);
             BandClient client;

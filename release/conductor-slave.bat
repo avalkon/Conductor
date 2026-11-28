@@ -1,0 +1,1 @@
+java -jar %0\..\conductor.jar --join insert.host.machines.local.ip.here  --name SecondPC  --key 'setan8digitormorekey'  --port 38791  --live  --music-dir "%USERPROFILE%\Documents\The Lord of the Rings Online\music"

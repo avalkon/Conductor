@@ -12,6 +12,7 @@ import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.time.Duration;
 
 /** Compact Swing desktop UI; never embeds a web browser or game view. */
@@ -21,6 +22,7 @@ public final class ConductorFrame extends JFrame {
     private final LocalAgent agent;
     private final ProfileStore profiles;
     private final SettingsStore settings;
+    private final LoginPanel loginPanel;
     private final DefaultListModel<Path> musicFoldersModel = new DefaultListModel<>();
     private final DefaultListModel<Path> musicSongsModel = new DefaultListModel<>();
     private final JList<Path> musicFolders = new JList<>(musicFoldersModel);
@@ -116,11 +118,12 @@ public final class ConductorFrame extends JFrame {
         Thread t = new Thread(r,"conductor-ui-worker"); t.setDaemon(true); return t;
     });
     public ConductorFrame(Options options, GameBackend backend, LocalAgent agent, BandClient client, BandServer server, ProfileStore profiles) {
-        super("LOTRO Conductor 0.12.7 — " + options.nodeName() + (options.local() ? " [LOCAL]" : options.host() ? " [HOST]" : " [AGENT]"));
+        super("LOTRO Conductor 0.12.15 — " + options.nodeName() + (options.local() ? " [LOCAL]" : options.host() ? " [HOST]" : " [AGENT]"));
         this.options = options; this.backend = backend; this.agent = agent; this.client = client; this.server = server; this.profiles = profiles;
         try { this.settings = new SettingsStore(profiles.path().resolveSibling("settings.properties")); }
         catch (IOException e) { throw new IllegalStateException("Cannot load Conductor settings: " + e.getMessage(), e); }
         backend.setChatTiming(settings.chatTiming());
+        backend.setChatPastePolicy(settings.pastePolicy());
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         addWindowListener(new WindowAdapter() {
             @Override public void windowClosing(WindowEvent e) { shutdown(); }
@@ -151,10 +154,14 @@ public final class ConductorFrame extends JFrame {
         pages.add(createRosterPanel(),"roster");
         pages.add(createLocalPanel(),"computer");
         pages.add(createSettingsPanel(),"settings");
+        loginPanel=new LoginPanel(agent,options.live()&&!options.demo(),profiles.path().resolveSibling("settings.properties").getParent(),
+                this::log,()->++latestFocusRequest,
+                message->confirmAction(message,"Launcher login",JOptionPane.WARNING_MESSAGE),this::launcherSelected);
+        pages.add(loginPanel,"login");
         JPanel navigation = new JPanel(new BorderLayout(5,0));
         JPanel tabButtons = new JPanel(new FlowLayout(FlowLayout.LEFT,2,0));
         ButtonGroup group = new ButtonGroup();
-        String[][] tabNames = {{"Music", "music"},{"Band", "roster"},{"Computer", "computer"},{"Settings", "settings"}};
+        String[][] tabNames = {{"Music", "music"},{"Band", "roster"},{"Computer", "computer"},{"Login", "login"},{"Settings", "settings"}};
         for (int i=0;i<tabNames.length;i++) {
             String[] item=tabNames[i];
             JToggleButton tab=new JToggleButton(item[0]);
@@ -539,7 +546,7 @@ public final class ConductorFrame extends JFrame {
         Map<JCheckBox,String> checkLabels=new LinkedHashMap<>();
         Map<JLabel,String> noteLabels=new LinkedHashMap<>();
 
-        JCheckBox confirm = new JCheckBox("Ask for confirmation before commands, assignments and deletion",settings.confirmActions());
+        JCheckBox confirm = new JCheckBox("Ask for confirmation before commands, assignments, login and deletion",settings.confirmActions());
         confirm.addActionListener(e -> {
             try {settings.setConfirmActions(confirm.isSelected()); log("Confirmations " +(confirm.isSelected()?"enabled":"disabled"));}
             catch(IOException ex){error("Cannot save settings: "+ex.getMessage());}
@@ -640,6 +647,47 @@ public final class ConductorFrame extends JFrame {
         timingNote.setForeground(Color.GRAY);
         noteLabels.put(timingNote,"After Enter, Conductor waits minimum + (typed characters × extra ms). Example: 100 ms + 20 characters × 15 ms = 400 ms. Maximum 60 seconds. Local per PC; sent is not game-confirmed.");
         addSettingLine(controls,timingNote);
+        ChatPastePolicy currentPaste = settings.pastePolicy();
+        JPanel pasteControls = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        JCheckBox pasteCheck = new JCheckBox("Paste long commands (Ctrl+V)", currentPaste.enabled());
+        pasteCheck.setToolTipText("This computer only. Long chat lines use Ctrl+V when clipboard access succeeds.");
+        JCheckBox preserveClipboard = new JCheckBox("Preserve clipboard contents", currentPaste.preserveClipboard());
+        preserveClipboard.setToolTipText("Keep checked to protect non-text/rich content. Unchecking permits replacing any existing clipboard item with the last pasted game command.");
+        preserveClipboard.setEnabled(pasteCheck.isSelected());
+        JSpinner pasteThreshold = new JSpinner(new SpinnerNumberModel(currentPaste.minimumCharacters(), 12, 512, 4));
+        pasteThreshold.setEnabled(pasteCheck.isSelected());
+        pasteControls.add(pasteCheck);
+        pasteControls.add(new JLabel("At least:"));
+        pasteControls.add(pasteThreshold);
+        pasteControls.add(new JLabel("characters"));
+        Runnable savePaste = () -> {
+            try {
+                ChatPastePolicy next = new ChatPastePolicy(pasteCheck.isSelected(), (Integer) pasteThreshold.getValue(), preserveClipboard.isSelected());
+                settings.setPastePolicy(next);
+                backend.setChatPastePolicy(next);
+                pasteThreshold.setEnabled(next.enabled());
+                preserveClipboard.setEnabled(next.enabled());
+                log("Local long-command paste mode saved: " + next);
+            } catch (Exception ex) { error("Cannot save clipboard paste setting: " + ex.getMessage()); }
+        };
+        pasteCheck.addActionListener(e -> savePaste.run());
+        pasteThreshold.addChangeListener(e -> savePaste.run());
+        addSettingLine(controls, pasteControls);
+        preserveClipboard.addActionListener(e -> {
+            if (!preserveClipboard.isSelected() && JOptionPane.showConfirmDialog(this,
+                    "Allow Conductor to replace the clipboard, including images, files and formatted text?\nThe last pasted chat command will remain on the clipboard.",
+                    "Allow clipboard replacement", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
+                preserveClipboard.setSelected(true);
+                return;
+            }
+            savePaste.run();
+        });
+        addSettingLine(controls, preserveClipboard);
+        JLabel pasteNote = new JLabel();
+        pasteNote.setFont(pasteNote.getFont().deriveFont(Font.PLAIN,11f));
+        pasteNote.setForeground(Color.GRAY);
+        noteLabels.put(pasteNote, "Paste retries a busy clipboard and logs the reason for typing fallback. Preserve protects rich clipboard content and restores text where possible. If unchecked, the last pasted command replaces the clipboard. No game acknowledgment.");
+        addSettingLine(controls, pasteNote);
         JButton resetEquipHistory = new JButton("Reset remembered Equip shortcuts (all computers)");
         resetEquipHistory.setToolTipText("Clear each agent's last successful Equip command. Next Equip can send the shortcut again.");
         resetEquipHistory.setEnabled(options.host());
@@ -964,9 +1012,16 @@ public final class ConductorFrame extends JFrame {
         songLabel.setText("Song: " + song.gamePath() + "   |   Assigned " + matched + "/" + song.parts().size() + " parts");
         songLabel.setToolTipText(song.file().toString());
     }
+    /** Shared optional-action confirmation gate. Read the current preference
+     * at click time; mandatory validation remains outside this gate. */
+    static boolean confirmIfEnabled(SettingsStore settings,BooleanSupplier prompt,Runnable suppressed) {
+        if (!settings.confirmActions()) { suppressed.run(); return true; }
+        return prompt.getAsBoolean();
+    }
     private boolean confirmAction(String message,String title,int messageType) {
-        if (!settings.confirmActions()) { log("Confirmation suppressed: " + title); return true; }
-        return JOptionPane.showConfirmDialog(this,message,title,JOptionPane.YES_NO_OPTION,messageType) == JOptionPane.YES_OPTION;
+        return confirmIfEnabled(settings,
+                ()->JOptionPane.showConfirmDialog(this,message,title,JOptionPane.YES_NO_OPTION,messageType)==JOptionPane.YES_OPTION,
+                ()->log("Confirmation suppressed: " + title));
     }
     private void musicAll() {
         if (roster.isEmpty()) { log("No registered characters to toggle"); return; }
@@ -1052,11 +1107,33 @@ public final class ConductorFrame extends JFrame {
         identify.addActionListener(e -> {
             GameWindow chosen = (GameWindow) windows.getSelectedItem();
             if (chosen == null) { error("Select a LOTRO window first"); return; }
+            ++latestFocusRequest;
             workers.submit(() -> {
-                try { backend.focusWindow(chosen); log("Focused candidate window " + chosen + " (no keys sent)"); }
+                try { agent.focusCandidateWindow(chosen).get();
+                    log("Focused candidate window " + chosen + " (no keys sent)"); }
                 catch (Exception ex) { log("Cannot identify window: " + ex.getMessage()); }
             });
         });
+        c.gridy++;
+        JButton resetKeyboard = new JButton("Reset keyboard state");
+        resetKeyboard.setToolTipText("Release Ctrl, Shift and Alt in the selected local LOTRO window; no chat or other key presses.");
+        resetKeyboard.setEnabled(options.live() && !options.demo());
+        resetKeyboard.addActionListener(e -> {
+            GameWindow chosen = (GameWindow) windows.getSelectedItem();
+            if (chosen == null) { error("Select a LOTRO window first"); return; }
+            if (JOptionPane.showConfirmDialog(this,
+                    "Focus the selected LOTRO window and release Ctrl, Shift and Alt?\nKeep your hands off the keyboard during the reset.",
+                    "Reset keyboard state", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+            ++latestFocusRequest;
+            var reset = agent.resetCandidateKeyboard(chosen);
+            resetKeyboard.setEnabled(false);
+            reset.whenComplete((unused, ex) -> SwingUtilities.invokeLater(() -> {
+                resetKeyboard.setEnabled(options.live() && !options.demo());
+                if (ex == null) log("KEYBOARD RESET SENT: " + chosen + " (modifier releases only; not game-confirmed)");
+                else log("KEYBOARD RESET FAILED: " + ex.getMessage());
+            }));
+        });
+        c.gridx=0; c.gridwidth=3; c.weightx=1; fields.add(resetKeyboard,c); c.gridwidth=1;
         c.gridy++; labelAndField(fields,c,"Character name",characterField);
         c.gridy++; labelAndField(fields,c,"Instrument (optional)",instrumentField);
         c.gridy++; labelAndField(fields,c,"Bridge status .plugindata (optional)",bridgeFileField);
@@ -1180,6 +1257,7 @@ public final class ConductorFrame extends JFrame {
                 "Close any open game chat/editor first. Continue?", "Identify game windows", JOptionPane.WARNING_MESSAGE)) return;
         int waitSeconds = (Integer) identifyWaitSpinner.getValue();
         savePluginRoot();
+        ++latestFocusRequest;
         cancelIdentification.set(false);
         identifyButton.setEnabled(false);
         cancelIdentifyButton.setEnabled(true);
@@ -1203,6 +1281,15 @@ public final class ConductorFrame extends JFrame {
         c.gridx=0; c.weightx=0; c.gridwidth=1; panel.add(new JLabel(label + ":"),c);
         c.gridx=1; c.weightx=1; panel.add(input,c);
     }
+    /** Login designation is local-only and updates the Computer dropdown at once.
+     * The backend also guards stale selections and already queued commands. */
+    private void launcherSelected(LauncherWindow launcher) {
+        agent.setLauncherWindow(launcher);
+        for(int i=windows.getItemCount()-1;i>=0;i--)
+            if(backend.isSelectedLauncher(windows.getItemAt(i)))windows.removeItemAt(i);
+        log(launcher==null?"Launcher selection cleared":"Launcher excluded from game windows: "+launcher.id());
+        refreshWindows();
+    }
     private void refreshWindows() {
         GameWindow selected = (GameWindow)windows.getSelectedItem();
         workers.submit(() -> {
@@ -1210,10 +1297,10 @@ public final class ConductorFrame extends JFrame {
                 List<GameWindow> found = backend.listWindows();
                 SwingUtilities.invokeLater(() -> {
                     windows.removeAllItems();
-                    for (GameWindow w : found) windows.addItem(w);
+                    for (GameWindow w : found) if(!backend.isSelectedLauncher(w))windows.addItem(w);
                     if (selected != null) for (int i=0; i<windows.getItemCount(); i++)
                         if (windows.getItemAt(i).id().equals(selected.id())) { windows.setSelectedIndex(i); break; }
-                    log("Discovered " + found.size() + " candidate LOTRO window(s)");
+                    log("Discovered " + windows.getItemCount() + " candidate LOTRO window(s)");
                 });
             } catch (Exception e) { log("Window discovery failed: " + e.getMessage()); }
         });
@@ -1265,6 +1352,7 @@ public final class ConductorFrame extends JFrame {
         if(key==null) {log("No shortcut assigned for "+instrument+" / "+name);return;}
         if(!confirmAction("Send "+key+" to "+name+" for "+instrument+"?",
                 "Test instrument shortcut",JOptionPane.QUESTION_MESSAGE))return;
+        ++latestFocusRequest;
         agent.testQuickslot(name,instrument,Shortcut.parse(key));
     }
 
@@ -1443,31 +1531,36 @@ public final class ConductorFrame extends JFrame {
     /** Return focus to the CONTROLLING computer only, after all action results arrive.
      * Unlike the existing FOCUS game action, this never targets a LOTRO window.
      * X11 also needs an explicit stack raise: Swing toFront() can focus without raising. */
-    private void focusThisConductor() {
-        if (!connected || !isDisplayable()) return;
-        if ((getExtendedState() & Frame.ICONIFIED) != 0)
-            setExtendedState(getExtendedState() & ~Frame.ICONIFIED);
-        toFront();
-        requestFocus();
-        if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("linux")
-                || System.getenv("DISPLAY") == null) {
-            log("Requested Conductor window activation after command group");
-            return;
-        }
-        String ownTitle = getTitle();
-        long ownPid = ProcessHandle.current().pid();
-        long request = latestFocusRequest;
-        // Never block Swing's event thread while calling X11 programs.
+    private void focusThisConductor(long request) {
+        if (!connected || request != latestFocusRequest || !isDisplayable()) return;
         try {
-            workers.execute(() -> {
+            agent.afterLocalInput(() -> {
                 if (!connected || request != latestFocusRequest) return;
-                ConductorWindowRaiser.Result result = ConductorWindowRaiser.raiseX11(ownTitle, ownPid);
-                SwingUtilities.invokeLater(() -> {
-                    if (connected && request == latestFocusRequest) log(result.description());
-                });
+                try {
+                    // Even the Swing activation must wait for all earlier local
+                    // input; a stale deferred timer must not interrupt chat.
+                    SwingUtilities.invokeAndWait(() -> {
+                        if (!connected || request != latestFocusRequest || !isDisplayable()) return;
+                        if ((getExtendedState() & Frame.ICONIFIED) != 0)
+                            setExtendedState(getExtendedState() & ~Frame.ICONIFIED);
+                        toFront();
+                        requestFocus();
+                    });
+                    if (!connected || request != latestFocusRequest) return;
+                    if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("linux")
+                            || System.getenv("DISPLAY") == null) {
+                        log("Requested Conductor window activation after command group");
+                    } else {
+                        ConductorWindowRaiser.Result result =
+                                ConductorWindowRaiser.raiseX11(getTitle(), ProcessHandle.current().pid());
+                        if (connected && request == latestFocusRequest) log(result.description());
+                    }
+                    // Allow the activation to settle before the next input task.
+                    Thread.sleep(120);
+                } catch (Exception ex) { log("Conductor refocus failed: " + ex.getMessage()); }
             });
         } catch (java.util.concurrent.RejectedExecutionException ignored) {
-            // The application is shutting down; do not raise an obsolete window.
+            // Application is shutting down.
         }
     }
     static boolean refocusCategory(String kind, SettingsStore preferences) {
@@ -1480,6 +1573,7 @@ public final class ConductorFrame extends JFrame {
     private void sendActions(List<PendingAction> actions) {
         if(actions.isEmpty()) return;
         if(!connected) { error("Connection is closed"); return; }
+        long request = ++latestFocusRequest;
         boolean focusAfter = options.host() && actions.stream()
                 .allMatch(action -> refocusCategory(action.kind(),settings));
         if(!focusAfter) {
@@ -1488,13 +1582,12 @@ public final class ConductorFrame extends JFrame {
         }
         // Tokens are attached to actions, and echoed by their actual owning agents.
         // A fixed delay after queuing would often race remote or multi-client input.
-        long request = ++latestFocusRequest;
         final javax.swing.Timer[] timer = new javax.swing.Timer[1];
         List<String> tokens = focusTracker.begin(actions.size(), () -> {
             if(timer[0] != null) timer[0].stop();
             // An older group finishing must not steal focus from a newer command.
             if(request == latestFocusRequest) {
-                javax.swing.Timer defer = new javax.swing.Timer(120,e -> focusThisConductor());
+                javax.swing.Timer defer = new javax.swing.Timer(120,e -> focusThisConductor(request));
                 defer.setRepeats(false); defer.start();
             }
         });
@@ -1502,11 +1595,14 @@ public final class ConductorFrame extends JFrame {
             int pending = 0;
             // Earlier tokens may already have acknowledged; expire the still-pending group.
             for(String token:tokens) if(focusTracker.pending(token) > 0) {
+                // Missing completions do not establish that local input is idle.
+                // Invalidate the refocus callback before expiring the group.
+                if (request == latestFocusRequest) ++latestFocusRequest;
                 pending = focusTracker.expire(token);
                 break;
             }
             if(pending > 0) log("Refocus timeout: " + pending +
-                    " action(s) did not acknowledge completion; inspect the development log.");
+                    " action(s) did not acknowledge completion; refocus skipped; inspect the development log.");
         });
         timer[0].setRepeats(false);
         timer[0].start();
@@ -1760,7 +1856,7 @@ public final class ConductorFrame extends JFrame {
         try { client.close(); } catch (Exception ignored) { }
         try { if (server != null) server.close(); } catch (Exception ignored) { }
         focusTracker.clear();
-        agent.close(); workers.shutdownNow(); dispose();
+        loginPanel.close(); agent.close(); workers.shutdownNow(); dispose();
         System.exit(0);
     }
 }

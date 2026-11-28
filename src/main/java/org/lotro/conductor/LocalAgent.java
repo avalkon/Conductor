@@ -114,9 +114,14 @@ public final class LocalAgent implements AutoCloseable {
                     outcomes.add(window.id() + ": no longer a verified LOTRO window; skipped"); continue;
                 }
                 String token = BridgeDiscovery.newToken();
-                backend.sendChat(window, "/conductor identify " + token);
+                // An identity probe must use the SAME per-computer input queue as
+                // remote commands and quickslots. Sending it from the UI worker
+                // could otherwise steal focus halfway through another command.
+                sendIdentificationChallenge(window, token);
                 pending.put(token, window);
-                progress.accept("Challenge sent to " + window.id() + "; awaiting PluginData save");
+                progress.accept("Challenge input completed for " + window.id() +
+                        " via " + backend.lastChatInputMethod() +
+                        "; awaiting PluginData save (not game-acknowledged)");
             } catch (Exception error) {
                 outcomes.add(window.id() + ": " + error.getMessage() + "; left unassigned");
             }
@@ -190,11 +195,80 @@ public final class LocalAgent implements AutoCloseable {
                 ": no identity response within " + timeout.toSeconds() + "s; left unassigned");
         return List.copyOf(outcomes);
     }
-    public void register(String name, String instrument, GameWindow win, Path statusFile) throws IOException {
+    /** Focus-only manual window identification shares the game-input queue,
+     * preventing a user click from stealing focus during an active chat line.
+     */
+    public CompletableFuture<Void> focusCandidateWindow(GameWindow window) {
+        CompletableFuture<Void> completion = new CompletableFuture<>();
+        inputQueue.submit(() -> {
+            try {
+                if(backend.isSelectedLauncher(window))throw new IOException("Selected launcher is excluded from game windows");
+                backend.focusWindow(window);
+                completion.complete(null);
+            } catch (Exception e) {
+                completion.completeExceptionally(e);
+            }
+        });
+        return completion;
+    }
+
+    /** Local-only recovery, including unregistered game clients. No key-down
+     * events or chat commands are sent. It shares the same input queue. */
+    public CompletableFuture<Void> resetCandidateKeyboard(GameWindow window) {
+        CompletableFuture<Void> completion = new CompletableFuture<>();
+        inputQueue.submit(() -> {
+            try {
+                if (!live || backend instanceof DemoBackend) throw new IOException("Keyboard reset requires live mode");
+                if (!backend.isValidWindow(window)) throw new IOException("LOTRO window missing or changed; refresh windows");
+                backend.resetKeyboard(window);
+                completion.complete(null);
+            } catch (Exception e) { completion.completeExceptionally(e); }
+        });
+        return completion;
+    }
+
+    /** Queue a host-window activation behind local input; no wire action. */
+    public void afterLocalInput(Runnable task) { inputQueue.submit(task); }
+
+    /** Serialize auto-identification behind ALL normal input on this computer.
+     * Completion only means that the local input backend finished its settling
+     * delay; it is not an acknowledgment from LOTRO or the Lua bridge.
+     */
+    private void sendIdentificationChallenge(GameWindow window, String token) throws Exception {
+        Future<?> scheduled = inputQueue.submit(() -> {
+            if (!backend.isValidWindow(window))
+                throw new IOException("LOTRO window changed before identification input");
+            backend.sendChat(window, "/conductor identify " + token);
+            return null;
+        });
+        try {
+            scheduled.get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception failure) throw failure;
+            throw e;
+        } catch (InterruptedException e) {
+            scheduled.cancel(true);
+            Thread.currentThread().interrupt();
+            throw e;
+        }
+    }
+
+    /** Block the designated launcher immediately, including an already
+     * registered window or queued candidate. Do not delete character profiles
+     * or unregister an existing character merely because selection changed. */
+    public synchronized void setLauncherWindow(LauncherWindow launcher) {
+        backend.setLauncherWindow(launcher);
+        if(launcher==null)return;
+        for(Binding binding:bindings.values())if(backend.isSelectedLauncher(binding.window()))
+            logger.accept("Launcher excluded; game input blocked for "+binding.character()+" until a different launcher is selected or cleared");
+    }
+    public synchronized void register(String name, String instrument, GameWindow win, Path statusFile) throws IOException {
         String character = name.strip();
         if (!character.matches("[\\p{L}0-9_-]{1,60}")) throw new IOException("Character must be 1–60 letters, digits, _ or -");
         if (instrument.length() > 150) throw new IOException("Instrument name is too long");
         if (win == null) throw new IOException("Select a game window");
+        if(backend.isSelectedLauncher(win))throw new IOException("This window is the selected launcher, not a game client");
         for (Binding existing : bindings.values()) {
             if (!existing.character().equalsIgnoreCase(character) && existing.window().id().equals(win.id()))
                 throw new IOException("That game window is already registered to " + existing.character());
@@ -382,6 +456,8 @@ public final class LocalAgent implements AutoCloseable {
                 if (!backend.isValidWindow(b.window()))
                     throw new IOException("Window changed after selecting fellow; refusing /follow");
                 backend.sendChat(b.window(), "/follow");
+                logger.accept("CHAT INPUT SETTLED " + b.character() + " => FOLLOW [" +
+                        backend.lastChatInputMethod() + "]");
             }
             return live ? "INPUT SENT: FOLLOW" : "DRY-RUN: FOLLOW";
         }
@@ -408,7 +484,8 @@ public final class LocalAgent implements AutoCloseable {
                 // This marker (and the later RESULT sent to the host) occurs only
                 // after the local backend's per-command post-submit settling barrier.
                 // It does not claim that LOTRO accepted the command.
-                logger.accept("CHAT INPUT SETTLED " + b.character() + " => " + kind);
+                logger.accept("CHAT INPUT SETTLED " + b.character() + " => " + kind +
+                        " [" + backend.lastChatInputMethod() + "]");
             }
             if (commands.size() > 1 && command != commands.get(commands.size()-1)) Thread.sleep(270);
         }

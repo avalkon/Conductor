@@ -27,10 +27,15 @@ public final class DevTests {
         bridge();
         bridgeIdentityAndStates();
         delayedIdentityAndCachedProfiles();
+        identityUsesSerializedInputQueue();
         profilesAndMatching();
         settingsAndWatcher();
         x11WindowRaceAndGuard();
         slowChatTypingBarriers();
+        clipboardPasteAndFallback();
+        windowsKeyboardSafety();
+        launcherLoginAndVault();
+        selectedLauncherExclusion();
         networkAndCommands();
         distributedCapabilitiesAndInput();
         localAgentPipeline();
@@ -868,6 +873,105 @@ public final class DevTests {
         } finally { server.close(); deleteTree(sandbox); }
     }
 
+    /** Regression: auto-identify must never steal focus while a queued action
+     * is still injecting keys into a different local LOTRO client. */
+    private static void identityUsesSerializedInputQueue() throws Exception {
+        Path sandbox = Files.createTempDirectory("conductor-identity-queue-");
+        Path report = sandbox.resolve("Acct/AllServers/NewMusician/ConductorStatus.plugindata");
+        Files.createDirectories(report.getParent());
+        Files.writeString(report, "\"CG2%NewMusician%Basic Harp%%0%unknown%unconfirmed%%\"");
+        GameWindow oldWindow = new GameWindow("0x1b1", "The Lord of the Rings Online");
+        GameWindow newWindow = new GameWindow("0x1b2", "The Lord of the Rings Online");
+        var shortcutStarted = new java.util.concurrent.CountDownLatch(1);
+        var allowShortcutToFinish = new java.util.concurrent.CountDownLatch(1);
+        var challengeStarted = new java.util.concurrent.CountDownLatch(1);
+        var focusStarted = new java.util.concurrent.CountDownLatch(1);
+        var resetStarted = new java.util.concurrent.CountDownLatch(1);
+        var refocusStarted = new java.util.concurrent.CountDownLatch(1);
+        var concurrent = new java.util.concurrent.atomic.AtomicBoolean();
+        var running = new java.util.concurrent.atomic.AtomicInteger();
+        GameBackend backend = new GameBackend() {
+            @Override public List<GameWindow> listWindows() { return List.of(oldWindow, newWindow); }
+            @Override public boolean isValidWindow(GameWindow window) { return listWindows().contains(window); }
+            @Override public void sendShortcut(GameWindow window, Shortcut shortcut) throws Exception {
+                if (running.incrementAndGet() != 1) concurrent.set(true);
+                try {
+                    check(window.equals(oldWindow), "Existing musician receives shortcut on own window");
+                    shortcutStarted.countDown();
+                    if (!allowShortcutToFinish.await(5, TimeUnit.SECONDS))
+                        throw new IOException("Test did not release existing shortcut");
+                } finally { running.decrementAndGet(); }
+            }
+            @Override public void sendChat(GameWindow window, String command) throws Exception {
+                if (running.incrementAndGet() != 1) concurrent.set(true);
+                try {
+                    check(window.equals(newWindow), "Identification only probes unregistered window");
+                    check(command.startsWith("/conductor identify "), "Complete identify command is dispatched");
+                    Files.writeString(report, "\"CG2%NewMusician%Basic Harp%%0%unknown%unconfirmed%" +
+                            command.substring("/conductor identify ".length()) + "%\"");
+                    challengeStarted.countDown();
+                } finally { running.decrementAndGet(); }
+            }
+            @Override public void focusWindow(GameWindow window) {
+                if (running.incrementAndGet() != 1) concurrent.set(true);
+                try { focusStarted.countDown(); }
+                finally { running.decrementAndGet(); }
+            }
+            @Override public void resetKeyboard(GameWindow window) {
+                if (running.incrementAndGet() != 1) concurrent.set(true);
+                try { check(window.equals(newWindow), "Reset targets selected client"); resetStarted.countDown(); }
+                finally { running.decrementAndGet(); }
+            }
+            @Override public String description() { return "identity queue regression mock"; }
+        };
+        try (BandServer server = new BandServer(0, "identity-queue-test")) {
+            server.start();
+            try (BandClient host = new BandClient("127.0.0.1", server.port(), "host", "identity-queue-test", true,
+                         queueListener(new LinkedBlockingQueue<>()));
+                 BandClient client = new BandClient("127.0.0.1", server.port(), "agent", "identity-queue-test", false,
+                         queueListener(new LinkedBlockingQueue<>()));
+                 LocalAgent agent = new LocalAgent(backend, sandbox, true, ignored -> {})) {
+                agent.setNetwork(client);
+                agent.register("AlreadyHere", "Basic Lute", oldWindow, null);
+                agent.testQuickslot("AlreadyHere", "Basic Lute", Shortcut.parse("Ctrl+1"));
+                check(shortcutStarted.await(2, TimeUnit.SECONDS), "Existing input is in progress");
+                var worker = Executors.newSingleThreadExecutor();
+                try {
+                    Future<List<String>> identification = worker.submit(() -> agent.identifyWindows(sandbox,
+                            java.time.Duration.ofSeconds(4), ignored -> {}, () -> false));
+                    Thread.sleep(180);
+                    check(challengeStarted.getCount() == 1,
+                            "Auto-identification waits while local quickslot still holds input queue");
+                    CompletableFuture<Void> focusOnly = agent.focusCandidateWindow(newWindow);
+                    CompletableFuture<Void> reset = agent.resetCandidateKeyboard(newWindow);
+                    agent.afterLocalInput(() -> {
+                        if (running.incrementAndGet() != 1) concurrent.set(true);
+                        try { refocusStarted.countDown(); }
+                        finally { running.decrementAndGet(); }
+                    });
+                    Thread.sleep(75);
+                    check(resetStarted.getCount() == 1 && refocusStarted.getCount() == 1,
+                            "Keyboard reset and Conductor refocus wait behind local input");
+                    check(focusStarted.getCount() == 1,
+                            "Manual Focus also waits for existing game input to complete");
+                    allowShortcutToFinish.countDown();
+                    List<String> results = identification.get(6, TimeUnit.SECONDS);
+                    focusOnly.get(3, TimeUnit.SECONDS);
+                    reset.get(3, TimeUnit.SECONDS);
+                    check(resetStarted.getCount() == 0 && refocusStarted.await(3, TimeUnit.SECONDS),
+                            "Keyboard reset and app refocus execute after preceding input");
+                    check(focusStarted.getCount() == 0, "Queued manual Focus eventually executes");
+                    check(challengeStarted.getCount() == 0 && agent.bindings().size() == 2,
+                            "Identity challenge runs after prior local action and binds its musician");
+                    check(!concurrent.get() && running.get() == 0,
+                            "Identity and ordinary local actions never inject into two windows concurrently");
+                    check(results.stream().anyMatch(v -> v.contains("identified NewMusician")),
+                            "Queued identity command still produces a valid challenge response");
+                } finally { allowShortcutToFinish.countDown(); worker.shutdownNow(); }
+            }
+        } finally { deleteTree(sandbox); }
+    }
+
     /** Saved files identify a character; a delayed fresh challenge connects it to a window. */
     private static void delayedIdentityAndCachedProfiles() throws Exception {
         Path root = Files.createTempDirectory("conductor-delayed-identity-");
@@ -944,6 +1048,21 @@ public final class DevTests {
             SettingsStore defaults = new SettingsStore(preferences);
             check(defaults.confirmActions() && !defaults.autoAcceptMatches() && !defaults.showDevLog(),
                     "safe settings defaults, development log hidden");
+            int[] promptCalls={0},skips={0};
+            java.util.function.Predicate<String> loginConfirm=message->ConductorFrame.confirmIfEnabled(defaults,
+                    ()->{promptCalls[0]++;return false;},()->skips[0]++);
+            check(!loginConfirm.test("Login checked accounts")&&promptCalls[0]==1&&skips[0]==0,
+                    "Enabled confirmation honors cancellation");
+            defaults.setConfirmActions(false);
+            check(loginConfirm.test("Login checked accounts")&&promptCalls[0]==1&&skips[0]==1,
+                    "Disabled confirmation skips login prompt and proceeds");
+            check(loginConfirm.test("Start launcher")&&promptCalls[0]==1&&skips[0]==2,
+                    "Launcher actions share the confirmation preference");
+            defaults.setConfirmActions(true);
+            check(!loginConfirm.test("Test first Enter")&&promptCalls[0]==2&&skips[0]==2,
+                    "Re-enabling confirmation is effective immediately, without recreating login panel");
+            check(ConductorFrame.confirmIfEnabled(defaults,()->true,()->{throw new AssertionError("Unexpected suppression");}),
+                    "Enabled confirmation proceeds when approved");
             defaults.setConfirmActions(false);
             defaults.setAutoAcceptMatches(true);
             defaults.setShowDevLog(true);
@@ -1004,6 +1123,7 @@ public final class DevTests {
         String bad = "X Error of failed request:  BadWindow (invalid Window parameter)\n" + one + two;
         java.util.concurrent.atomic.AtomicInteger attempts = new java.util.concurrent.atomic.AtomicInteger();
         X11Backend backend = new X11Backend((seconds, argv) -> {
+            if(argv[0].equals("xprop"))return new ProcessTools.Result(0,"WM_CLASS(STRING) = \"lotroclient64.exe\"");
             if (argv[0].equals("wmctrl")) {
                 return attempts.incrementAndGet() == 1 ? new ProcessTools.Result(1, bad) :
                     new ProcessTools.Result(0, one + two);
@@ -1023,6 +1143,7 @@ public final class DevTests {
 
         java.util.concurrent.atomic.AtomicInteger rescans = new java.util.concurrent.atomic.AtomicInteger();
         X11Backend partial = new X11Backend((seconds, argv) -> {
+            if(argv[0].equals("xprop"))return new ProcessTools.Result(0,"WM_CLASS(STRING) = \"lotroclient64.exe\"");
             rescans.incrementAndGet();
             return new ProcessTools.Result(1, bad);
         });
@@ -1046,7 +1167,7 @@ public final class DevTests {
                 return new ProcessTools.Result(0, "The Lord of the Rings Online™\n");
             if (argv[0].equals("xdotool") && argv[1].equals("getactivewindow"))
                 return new ProcessTools.Result(0, "123\n");
-            if (argv[0].equals("xdotool") && argv[1].equals("key"))
+            if (argv[0].equals("xdotool") && Set.of("key","keyup","type").contains(argv[1]))
                 throw new AssertionError("Keyboard command sent to wrong foreground window");
             return new ProcessTools.Result(0, "");
         });
@@ -1054,8 +1175,20 @@ public final class DevTests {
                 "Must abort after unsuccessful focus request");
         expectFailure(() -> wrongFocus.focusWindow(found.get(0)),
                 "Identify/focus-only action must also fail closed on wrong window");
+        expectFailure(() -> wrongFocus.resetKeyboard(found.get(0)), "Wrong foreground aborts keyboard reset");
+        check(!X11Backend.mappedModifiers(X11_MODIFIERS).contains("Alt_R") &&
+                X11Backend.mappedModifiers(X11_MODIFIERS).contains("ISO_Level3_Shift"),
+                "Absent right Alt is never requested (avoids temporary X11 key remapping)");
+        check(X11Backend.mappedModifiers("mod2 Num_Lock (0x4d)\nmod4 Super_L (0x85)").isEmpty(),
+                "Reset does not send unrelated modifiers or lock keys");
         checks++;
     }
+
+    private static final String X11_MODIFIERS =
+            "shift       Shift_L (0x32), Shift_R (0x3e)\n" +
+            "control     Control_L (0x25), Control_R (0x69)\n" +
+            "mod1        Alt_L (0x40), Meta_L (0xcd)\n" +
+            "mod5        ISO_Level3_Shift (0x5c)\n";
 
     /** Slow-clients: do not refocus the next LOTRO window until chat has opened,
      * all text is emitted, Return is sent, and the post-submit barrier elapsed.
@@ -1099,6 +1232,7 @@ public final class DevTests {
             java.util.List<String> operations=new java.util.concurrent.CopyOnWriteArrayList<>();
             java.util.List<Long> milliseconds=new java.util.concurrent.CopyOnWriteArrayList<>();
             X11Backend backend=new X11Backend((timeout, args) -> {
+                if(args[0].equals("xprop"))return new ProcessTools.Result(0,"WM_CLASS(STRING) = \"lotroclient64.exe\"");
                 if(args[0].equals("wmctrl") && args[1].equals("-ia")) {
                     focused.set(Long.parseUnsignedLong(args[2].substring(2),16));
                     operations.add("FOCUS:"+args[2]); milliseconds.add(System.nanoTime());
@@ -1106,6 +1240,12 @@ public final class DevTests {
                     return new ProcessTools.Result(0,Long.toUnsignedString(focused.get())+"\n");
                 } else if(args[0].equals("xdotool") && args[1].equals("getwindowname")) {
                     return new ProcessTools.Result(0,"The Lord of the Rings Online™\n");
+                } else if(args[0].equals("xmodmap")) {
+                    return new ProcessTools.Result(0, X11_MODIFIERS);
+                } else if(args[0].equals("xdotool") && args[1].equals("keyup")) {
+                    check(Arrays.equals(Arrays.copyOfRange(args, 2, args.length),
+                        new String[]{"Shift_L","Shift_R","Control_L","Control_R","Alt_L","ISO_Level3_Shift"}),
+                        "Only actually mapped modifier key-up events precede typing");
                 } else if(args[0].equals("xdotool") && args[1].equals("key")) {
                     operations.add("ENTER:"+focused.get()); milliseconds.add(System.nanoTime());
                 } else if(args[0].equals("xdotool") && args[1].equals("type")) {
@@ -1148,6 +1288,510 @@ public final class DevTests {
                 });
             }
         }
+    }
+
+    /** Long commands paste as one key combination, preserving ordinary clipboard text;
+     * short commands and non-text/rich clipboard contents continue to use typing. */
+    private static void clipboardPasteAndFallback() throws Exception {
+        ChatPastePolicy disabled=ChatPastePolicy.DEFAULT;
+        ChatPastePolicy enabled=new ChatPastePolicy(true, 12);
+        check(!disabled.shouldPaste("/play a long song sync"), "Paste is opt-in");
+        check(!enabled.shouldPaste("/music") && enabled.shouldPaste("/conductor report"),
+                "Only sufficiently long command lines use clipboard mode");
+        check(!enabled.shouldPaste("a\nb"), "Multi-line paste is never enabled");
+        expectFailure(() -> new ChatPastePolicy(true, 0), "Invalid paste threshold is rejected");
+        Path dir=Files.createTempDirectory("conductor-paste-prefs-");
+        try {
+            SettingsStore prefs=new SettingsStore(dir.resolve("settings.properties"));
+            check(prefs.pastePolicy().equals(ChatPastePolicy.DEFAULT), "Old preferences default to typing");
+            prefs.setPastePolicy(new ChatPastePolicy(true, 55));
+            check(new SettingsStore(prefs.path()).pastePolicy().equals(new ChatPastePolicy(true,55)),
+                    "Paste option and threshold survive restart");
+            prefs.setPastePolicy(new ChatPastePolicy(true,55,false));
+            check(!new SettingsStore(prefs.path()).pastePolicy().preserveClipboard(),
+                    "Explicit clipboard replacement setting persists");
+            Files.writeString(prefs.path(), "pasteLongChat=true\npasteThresholdChars=55\n");
+            check(new SettingsStore(prefs.path()).pastePolicy().preserveClipboard(),
+                    "Existing enabled paste settings preserve clipboard by default");
+            // Java Clipboard can be used without a graphical display in tests.
+            // Use a pure in-memory clipboard so --self-test does not require
+            // a working X display just to emulate ownership and paste behavior.
+            class MemoryClipboard extends java.awt.datatransfer.Clipboard {
+                java.awt.datatransfer.Transferable current;
+                java.awt.datatransfer.ClipboardOwner currentOwner;
+                MemoryClipboard() { super("mock-clipboard"); }
+                @Override public synchronized java.awt.datatransfer.Transferable getContents(Object requestor) {
+                    return current;
+                }
+                @Override public synchronized void setContents(java.awt.datatransfer.Transferable value,
+                                                                 java.awt.datatransfer.ClipboardOwner owner) {
+                    var previousOwner = currentOwner;
+                    var previousValue = current;
+                    current = value;
+                    currentOwner = owner;
+                    if (previousOwner != null) previousOwner.lostOwnership(this, previousValue);
+                }
+            }
+            java.awt.datatransfer.Clipboard clipboard=new MemoryClipboard();
+            clipboard.setContents(new java.awt.datatransfer.StringSelection("previous user's note"),null);
+            ChatClipboard.Lease lease=ChatClipboard.acquire(clipboard,"/play nested song sync");
+            check(lease!=null && "/play nested song sync".equals(
+                    clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                    "Clipboard contains the temporary game command");
+            check(lease.matchesCurrent(), "Clipboard still matches the command before Ctrl+V");
+            lease.close();
+            check("previous user's note".equals(clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                    "Previous plain text is restored after command");
+            lease.close();
+            clipboard.setContents(new java.awt.datatransfer.StringSelection("original"),null);
+            lease=ChatClipboard.acquire(clipboard,"/play nested song sync");
+            clipboard.setContents(new java.awt.datatransfer.StringSelection("new copy from another app"),null);
+            check(!lease.matchesCurrent(), "Changed clipboard is detected before paste");
+            lease.close();
+            check("new copy from another app".equals(clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                    "Clipboard restoration does not overwrite a user's newer copy");
+            // A non-text item must not be replaced, even temporarily.
+            java.awt.datatransfer.Transferable imageOnly = new java.awt.datatransfer.Transferable() {
+                @Override public java.awt.datatransfer.DataFlavor[] getTransferDataFlavors() {
+                    return new java.awt.datatransfer.DataFlavor[]{java.awt.datatransfer.DataFlavor.imageFlavor};
+                }
+                @Override public boolean isDataFlavorSupported(java.awt.datatransfer.DataFlavor flavor) {
+                    return flavor.equals(java.awt.datatransfer.DataFlavor.imageFlavor);
+                }
+                @Override public Object getTransferData(java.awt.datatransfer.DataFlavor flavor) {
+                    return new java.awt.image.BufferedImage(1,1,java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                }
+            };
+            clipboard.setContents(imageOnly,null);
+            check(ChatClipboard.acquire(clipboard,"/play nested song sync")==null,
+                    "Non-text clipboard content is protected and forces typed fallback");
+            check(clipboard.getContents(null)==imageOnly, "Non-text clipboard content is unchanged");
+
+            var emptyClipboard = new java.awt.datatransfer.Transferable() {
+                public java.awt.datatransfer.DataFlavor[] getTransferDataFlavors() { return new java.awt.datatransfer.DataFlavor[0]; }
+                public boolean isDataFlavorSupported(java.awt.datatransfer.DataFlavor f) { return false; }
+                public Object getTransferData(java.awt.datatransfer.DataFlavor f) { throw new AssertionError("Empty clipboard"); }
+            };
+            clipboard.setContents(emptyClipboard,null);
+            lease = ChatClipboard.acquire(clipboard, "/conductor report");
+            check(lease != null && lease.matchesCurrent(), "Empty native clipboard with no flavors permits paste");
+            lease.close();
+            check("".equals(clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                    "Empty clipboard restored as empty text");
+            var plainFlavor = new java.awt.datatransfer.DataFlavor("text/plain;class=java.io.Reader");
+            clipboard.setContents(new java.awt.datatransfer.Transferable() {
+                public java.awt.datatransfer.DataFlavor[] getTransferDataFlavors() { return new java.awt.datatransfer.DataFlavor[]{plainFlavor}; }
+                public boolean isDataFlavorSupported(java.awt.datatransfer.DataFlavor f) { return plainFlavor.equals(f); }
+                public Object getTransferData(java.awt.datatransfer.DataFlavor f) { return new java.io.StringReader("native text"); }
+            }, null);
+            lease = ChatClipboard.acquire(clipboard, "/conductor report");
+            check(lease != null && lease.matchesCurrent(), "Plain-text native flavor works without Java String flavor");
+            lease.close();
+            check("native text".equals(clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)), "Native plain text restored");
+            var busyCalls = new java.util.concurrent.atomic.AtomicInteger();
+            var retry = ChatClipboard.tryLease(() -> {
+                if (busyCalls.incrementAndGet() < 3) throw new IllegalStateException("temporary lock");
+                return clipboard;
+            }, "/conductor report", true);
+            check(retry.lease() != null && busyCalls.get() == 3, "Temporary clipboard lock retries and recovers");
+            retry.lease().close();
+            var blocked = ChatClipboard.tryLease(() -> { throw new IllegalStateException("locked"); }, "/conductor report", true);
+            check(blocked.lease() == null && blocked.reason().contains("busy after 3"), "Permanent lock gets concrete fallback reason");
+            var denied = ChatClipboard.tryLease(() -> { throw new SecurityException("secret"); }, "/conductor report", true);
+            check(denied.lease() == null && denied.reason().equals("clipboard access denied"), "Clipboard errors identify cause without disclosing data");
+            clipboard.setContents(imageOnly,null);
+            var protectedItem = ChatClipboard.tryLease(() -> clipboard, "/conductor report", true);
+            check(protectedItem.lease() == null && protectedItem.reason().contains("protected non-plain-text format"),
+                    "Rich clipboard fallback explains protected format");
+            var overwrite = ChatClipboard.tryLease(() -> clipboard, "/conductor report", false);
+            check(overwrite.lease() != null && overwrite.lease().matchesCurrent(),
+                    "Explicit replacement can paste even when clipboard contained an image");
+            overwrite.lease().close();
+            check("/conductor report".equals(clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                    "Explicit replacement does not pretend to restore clipboard");
+            clipboard.setContents(new java.awt.datatransfer.StringSelection("saved copy"),null);
+            List<String> calls = new ArrayList<>();
+            java.util.concurrent.atomic.AtomicLong focused=new java.util.concurrent.atomic.AtomicLong();
+            X11Backend mock=new X11Backend((seconds,args)-> {
+                if(args[0].equals("xprop"))return new ProcessTools.Result(0,"WM_CLASS(STRING) = \"lotroclient64.exe\"");
+                if(args[0].equals("wmctrl")) {
+                    focused.set(Long.parseUnsignedLong(args[2].substring(2),16));
+                    calls.add("FOCUS");
+                } else if(args[0].equals("xmodmap")) {
+                    return new ProcessTools.Result(0, X11_MODIFIERS);
+                } else if(args[1].equals("getwindowname")) {
+                    return new ProcessTools.Result(0,"The Lord of the Rings Online\n");
+                } else if(args[1].equals("getactivewindow")) {
+                    return new ProcessTools.Result(0,focused.get()+"\n");
+                } else if(args[1].equals("keyup")) {
+                    calls.add("RESET");
+                } else if(args[1].equals("key")) {
+                    calls.add("KEY:"+args[3]);
+                } else if(args[1].equals("type")) {
+                    calls.add("TYPE:"+args[6]);
+                } else throw new AssertionError("Unexpected input tool: "+Arrays.toString(args));
+                return new ProcessTools.Result(0,"");
+            }, () -> clipboard);
+            mock.setChatTiming(new ChatInputTiming(0,0,0,0,100));
+            mock.setChatPastePolicy(enabled);
+            GameWindow win=new GameWindow("0x00000123","The Lord of the Rings Online");
+            mock.sendChat(win,"/conductor report");
+            check(calls.equals(List.of("FOCUS","RESET","KEY:Return","KEY:ctrl+v","KEY:Return")),
+                    "X11 paste sends one Ctrl+V and Return, not one key per character");
+            check("saved copy".equals(clipboard.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                    "Clipboard restored after paste/submit barrier");
+            calls.clear();
+            mock.sendChat(win,"/music");
+            check(calls.equals(List.of("FOCUS","RESET","KEY:Return","TYPE:/music","KEY:Return")),
+                    "Short lines continue to be typed, not pasted");
+            clipboard.setContents(imageOnly,null);
+            calls.clear();
+            mock.sendChat(win,"/conductor report");
+            check(calls.equals(List.of("FOCUS","RESET","KEY:Return","TYPE:/conductor report","KEY:Return")),
+                    "Unavailable clipboard falls back to existing type logic");
+            check(mock.lastChatInputMethod().contains("protected non-plain-text"), "X11 log exposes why paste was unavailable");
+            calls.clear();
+            mock.resetKeyboard(win);
+            check(calls.equals(List.of("FOCUS","RESET")), "Manual keyboard reset emits no key-down or chat");
+            calls.clear();
+            mock.setChatPastePolicy(new ChatPastePolicy(true, 12, false));
+            mock.sendChat(win,"/conductor report");
+            check(calls.equals(List.of("FOCUS","RESET","KEY:Return","KEY:ctrl+v","KEY:Return")),
+                    "Unprotected clipboard mode sends actual paste even when original was rich");
+        } finally { deleteTree(dir); }
+    }
+
+    private static void windowsKeyboardSafety() throws Exception {
+        var game = new GameWindow("1234", "The Lord of the Rings Online");
+        List<String> scripts = new ArrayList<>();
+        WindowsBackend windows = new WindowsBackend((seconds, args) -> {
+            String script = args[args.length - 1];
+            scripts.add(script);
+            if (script.endsWith("::ForegroundPid()")) return "1234\n";
+            if (script.endsWith("::ReleaseModifiers(1234)")) return "True\n";
+            return "";
+        });
+        windows.resetKeyboard(game);
+        check(scripts.get(0).contains("Get-Process -Id 1234") && scripts.get(0).contains("AppActivate(1234)"),
+                "Windows focus validates LOTRO process before activation");
+        check(scripts.size() == 4 && scripts.get(2).contains("::ReleaseModifiers(1234)"),
+                "Windows releases modifiers only after focus verification");
+        scripts.clear();
+        WindowsBackend wrong = new WindowsBackend((seconds, args) -> {
+            String script = args[args.length - 1];
+            scripts.add(script);
+            return script.endsWith("::ForegroundPid()") ? "9999\n" : "";
+        });
+        expectFailure(() -> wrong.resetKeyboard(game), "Windows app activation success alone does not authorize key release");
+        check(scripts.size() == 2, "Windows wrong foreground aborts before any key-up");
+        expectFailure(() -> wrong.focusWindow(new GameWindow("0","fake")), "Invalid Windows PID fails closed");
+
+        class RecordedKeys implements KeyTyper.Keys {
+            List<String> events = new ArrayList<>();
+            Set<Integer> held = new HashSet<>();
+            int failPress = -1;
+            public void press(int code) {
+                events.add("down:" + code); held.add(code);
+                if (code == failPress) throw new IllegalStateException("simulated partial key-down");
+            }
+            public void release(int code) { events.add("up:" + code); held.remove(code); }
+        }
+        int enter = java.awt.event.KeyEvent.VK_ENTER, shift = java.awt.event.KeyEvent.VK_SHIFT;
+        int a = java.awt.event.KeyEvent.VK_A, control = java.awt.event.KeyEvent.VK_CONTROL;
+        int v = java.awt.event.KeyEvent.VK_V;
+        RecordedKeys keys = new RecordedKeys();
+        ChatInputTiming zero = new ChatInputTiming(0,0,0,0);
+        var memory = new java.awt.datatransfer.Clipboard("test");
+        keys.failPress = a;
+        expectFailure(() -> KeyTyper.command("A", zero, ChatPastePolicy.DEFAULT, () -> {}, keys, () -> memory),
+                "Windows simulated partial capital key press fails");
+        check(keys.held.isEmpty() && keys.events.equals(List.of("down:"+enter,"up:"+enter,
+                "down:"+shift,"down:"+a,"up:"+a,"up:"+shift)),
+                "Windows always releases key and Shift on partial typing failure");
+        keys.events.clear(); keys.failPress = v;
+        memory.setContents(new java.awt.datatransfer.StringSelection("original"), null);
+        expectFailure(() -> KeyTyper.command("/conductor report", zero, new ChatPastePolicy(true,12),
+                () -> {}, keys, () -> memory), "Windows paste failure fails closed");
+        check(keys.held.isEmpty() && keys.events.equals(List.of("down:"+enter,"up:"+enter,
+                "down:"+control,"down:"+v,"up:"+v,"up:"+control)),
+                "Windows Ctrl+V releases both keys even if paste key fails");
+        check("original".equals(memory.getData(java.awt.datatransfer.DataFlavor.stringFlavor)),
+                "Failed paste restores original clipboard");
+        keys.events.clear(); keys.failPress = -1;
+        var guards = new java.util.concurrent.atomic.AtomicInteger();
+        expectFailure(() -> KeyTyper.command("/music", zero, ChatPastePolicy.DEFAULT,
+                () -> { if (guards.incrementAndGet()==2) throw new IOException("focus lost"); }, keys, () -> memory),
+                "Windows aborts if focus changes after opening chat");
+        check(keys.events.equals(List.of("down:"+enter,"up:"+enter)), "No command text or final Enter after focus loss");
+        keys.events.clear(); guards.set(0);
+        expectFailure(() -> KeyTyper.command("/music", zero, ChatPastePolicy.DEFAULT,
+                () -> { if (guards.incrementAndGet()==3) throw new IOException("focus lost before submit"); }, keys, () -> memory),
+                "Windows aborts final Enter on lost foreground");
+        check(Collections.frequency(keys.events, "down:"+enter)==1, "Final Enter never targets different window");
+        keys.events.clear(); keys.failPress = java.awt.event.KeyEvent.VK_1;
+        expectFailure(() -> KeyTyper.shortcut(keys, Shortcut.parse("Ctrl+Shift+1")), "Windows shortcut partial failure");
+        check(keys.held.isEmpty(), "Windows shortcut unwinds every modifier");
+    }
+
+    /** Headless login/vault regression: never use actual credentials or desktop input. */
+    private static void selectedLauncherExclusion() throws Exception {
+        String title="The Lord of the Rings Online";
+        String[] snapshot={"0x00000101 0 0 pc "+title+"\n0x00000102 0 0 pc "+title+"\n"};
+        int[] inputCalls={0};
+        X11Backend backend=new X11Backend((seconds,args)->{
+            if(args[0].equals("wmctrl")&&args[1].equals("-l"))
+                return new ProcessTools.Result(0,snapshot[0]);
+            if(args[0].equals("xprop"))return new ProcessTools.Result(0,"WM_CLASS(STRING) = \"wine\"");
+            if(args[0].equals("xdotool")&&args[1].equals("getwindowname"))
+                return new ProcessTools.Result(0,title);
+            inputCalls[0]++;throw new AssertionError("Unexpected launcher input");
+        });
+        LauncherWindow launcher=new LauncherWindow("0x00000101",0,title,"ambiguous",false,0);
+        GameWindow game=new GameWindow("0x00000102",title);
+        GameWindow blocked=new GameWindow("0x101",title);
+        check(backend.listWindows().size()==2,"Ambiguous launcher initially appears as ordinary candidate");
+        backend.setLauncherWindow(launcher);
+        check(backend.listWindows().equals(List.of(game)),"Selected XID excluded; same-title game client remains visible");
+        check(!backend.isValidWindow(blocked)&&backend.isValidWindow(game),"Exact XID guard handles different padding and same title");
+        expectFailure(()->backend.focusWindow(blocked),"Launcher cannot receive focus-only identification");
+        expectFailure(()->backend.sendChat(blocked,"/conductor identify abc"),"Launcher cannot receive identity or game chat");
+        expectFailure(()->backend.sendShortcut(blocked,Shortcut.parse("SPACE")),"Launcher cannot receive quickslots");
+        expectFailure(()->backend.resetKeyboard(blocked),"Launcher cannot receive keyboard reset");
+        check(inputCalls[0]==0,"Excluded launcher receives no desktop input");
+        Path temp=Files.createTempDirectory("conductor-launcher-exclude-");
+        try(LocalAgent agent=new LocalAgent(backend,temp,true,msg->{})){
+            expectFailure(()->agent.register("NotAGame","",blocked,null),"Manual registration of selected launcher blocked before networking");
+            expectFailure(()->agent.focusCandidateWindow(blocked).get(2,TimeUnit.SECONDS),"Stale candidate focus blocked in local input queue");
+            String full=snapshot[0];
+            snapshot[0]="0x00000101 0 0 pc "+title+"\n";
+            check(agent.identifyWindows(temp,java.time.Duration.ofMillis(100),msg->{},()->false).isEmpty(),
+                    "Automatic identification skips selected launcher entirely");
+            snapshot[0]=full;
+        }finally{deleteTree(temp);}
+        backend.setLauncherWindow(null);
+        check(backend.listWindows().size()==2,"Clear launcher restores candidate to Computer");
+        backend.setLauncherWindow(launcher);
+        snapshot[0]="0x00000102 0 0 pc "+title+"\n";
+        check(backend.listWindows().equals(List.of(game)),"Closed launcher disappears from successful enumeration");
+        snapshot[0]="0x00000101 0 0 pc "+title+"\n0x00000102 0 0 pc "+title+"\n";
+        check(backend.listWindows().size()==2,"Reused XID after observed close is not permanently blacklisted");
+        LauncherExclusion race=new LauncherExclusion();
+        race.set(launcher);
+        LauncherWindow previous=race.current();
+        var replacement=new LauncherWindow("0x00000102",0,title,"new",false,0);
+        race.set(replacement);
+        race.observeX11(previous,"");
+        check(race.x11(replacement.id()),"Earlier enumeration cannot clear newly selected launcher");
+        LauncherWindow withPid=new LauncherWindow("0x00000101",123,title,"old pid",false,0);
+        race.set(withPid);
+        race.observeX11(withPid,"0x00000101 0 456 pc "+title);
+        check(!race.x11(withPid.id()),"Reused XID with different PID is released");
+
+        WindowsBackend win=new WindowsBackend((seconds,args)->{
+            if(args[args.length-1].contains("Get-Process | Where-Object"))
+                return "2345|"+title+"\n3456|"+title+"\n";
+            throw new AssertionError("Launcher should be blocked before native input");
+        });
+        GameWindow winLauncher=new GameWindow("2345",title),winGame=new GameWindow("3456",title);
+        win.setLauncherWindow(new LauncherWindow("98765",2345,title,"unknown",false,0));
+        check(win.listWindows().equals(List.of(winGame)),"Windows maps chosen launcher HWND to game-list PID");
+        check(!win.isValidWindow(winLauncher)&&win.isValidWindow(winGame),"Windows same-title game remains valid");
+        expectFailure(()->win.focusWindow(winLauncher),"Windows selected launcher cannot be focused as game");
+        expectFailure(()->win.sendShortcut(winLauncher,Shortcut.parse("SPACE")),"Windows selected launcher cannot receive game keys");
+        win.setLauncherWindow(null);
+        check(win.listWindows().size()==2,"Windows clearing designation restores candidate");
+    }
+
+    private static void launcherLoginAndVault() throws Exception {
+        Path dir=Files.createTempDirectory("conductor-launcher-");
+        char[] master="six123".toCharArray(), secret="tEst!@#$%^&*()_+[]{}?<>".toCharArray();
+        try{
+            LauncherVault vault=new LauncherVault(dir.resolve("launcher.vault"));
+            expectFailure(()->vault.create("short".toCharArray()),"Reject a master password shorter than six");
+            vault.create(master);
+            check(vault.exists()&&vault.unlocked(),"Six-character master password is accepted");
+            vault.put("TestAccount",secret);
+            byte[] first=Files.readAllBytes(dir.resolve("launcher.vault"));
+            check(!new String(first,java.nio.charset.StandardCharsets.ISO_8859_1).contains("TestAccount"),"Vault account entries are encrypted");
+            byte[] utf16=new String(secret).getBytes(java.nio.charset.StandardCharsets.UTF_16BE);
+            check(java.util.Collections.indexOfSubList(toByteList(first),toByteList(utf16))<0,"Game password is not stored as plaintext UTF-16");
+            vault.put("TestAccount",secret);
+            check(!Arrays.equals(first,Files.readAllBytes(dir.resolve("launcher.vault"))),"Vault saves use fresh nonces");
+            vault.close();
+            check(!vault.unlocked()&&!vault.has("TestAccount"),"Lock removes decrypted credentials");
+            expectFailure(()->vault.unlock("wrong!".toCharArray()),"Wrong master password fails authentication");
+            vault.unlock(master);
+            char[] decoded=vault.copyPassword("TestAccount");
+            check(Arrays.equals(decoded,secret),"Encrypted password survives restart/unlock");
+            Arrays.fill(decoded,'\0');
+            vault.remove("TestAccount");
+            vault.close();vault.unlock(master);
+            check(!vault.has("TestAccount"),"Removing account deletes saved password");
+            vault.close();
+            byte[] clean=Files.readAllBytes(dir.resolve("launcher.vault"));
+            byte[] tampered=clean.clone();tampered[tampered.length-1]^=1;
+            Files.write(dir.resolve("launcher.vault"),tampered);
+            expectFailure(()->vault.unlock(master),"Tampered vault authentication tag fails");
+            Files.write(dir.resolve("launcher.vault"),clean);
+            vault.unlock(master);vault.close();
+
+            LauncherPreferences prefs=new LauncherPreferences(dir.resolve("launcher.properties"));
+            prefs.accounts=List.of("A","B");prefs.checked=Set.of("B");prefs.script="/some/launcher.sh";
+            prefs.timing=new LauncherLogin.Timing(50,2500,8000,1800,90000);prefs.save();
+            var restored=new LauncherPreferences(dir.resolve("launcher.properties"));
+            check(restored.accounts.equals(prefs.accounts)&&restored.checked.equals(Set.of("B")),"Saved accounts and checkboxes survive restart");
+            check(restored.timing.equals(prefs.timing)&&restored.script.equals(prefs.script),"Script and login timing survive restart");
+            check(!Files.readString(dir.resolve("launcher.properties")).contains("password"),"Preferences contain no password fields");
+
+            check(LauncherPlatform.launcherExecutable("C:\\Games\\LotroLauncher.exe") &&
+                    !LauncherPlatform.launcherExecutable("lotroclient64.exe"),"Launcher executable distinct from game client");
+            check(LauncherPlatform.launcherClass("WM_CLASS(STRING) = \"lotrolauncher.exe\", \"lotrolauncher.exe\""),
+                    "X11 launcher WM_CLASS recognized");
+            check(!LauncherPlatform.launcherClass("WM_CLASS(STRING) = \"lotroclient64.exe\", \"lotroclient64.exe\""),
+                    "Game client is not accepted as launcher");
+            long pid=ProcessHandle.current().pid();
+            long[] focused={0x101};
+            LauncherPlatform.X11 x11=new LauncherPlatform.X11((seconds,args)->{
+                if(args[0].equals("wmctrl")&&args[1].equals("-l"))return "0x00000101 0 "+pid+" pc The Lord of the Rings Online\n0x00000102 0 "+pid+" pc The Lord of the Rings Online\n";
+                if(args[0].equals("xprop")){
+                    boolean launcher=args[2].equals("0x00000101");
+                    return "WM_CLASS(STRING) = \""+(launcher?"lotrolauncher.exe":"lotroclient64.exe")+"\"\n_NET_WM_PID(CARDINAL) = "+pid+"\n";
+                }
+                if(args[0].equals("wmctrl")){focused[0]=Long.parseLong(args[2].substring(2),16);return "";}
+                if(args[1].equals("getactivewindow"))return Long.toString(focused[0]);
+                if(args[1].equals("getwindowgeometry"))return "WINDOW=257\nX=10\nY=20\nWIDTH=720\nHEIGHT=560\nSCREEN=0\n";
+                throw new AssertionError("Unexpected launcher tool");
+            });
+            List<LauncherWindow> discovered=x11.list();
+            check(discovered.size()==2&&discovered.get(0).id().equals("0x00000101")&&discovered.get(0).recognized()
+                    &&!discovered.get(1).recognized(),"Known launcher ranked first; same-title game remains selectable candidate");
+            check(LauncherWindow.newSince(List.of(discovered.get(1)),discovered).equals(List.of(discovered.get(0))),
+                    "Script discovery prioritizes new window over pre-existing game");
+            check(LauncherWindow.newSince(discovered,discovered).isEmpty(),"Existing windows are not mistaken for newly opened ones");
+            LauncherPlatform.X11 ambiguous=new LauncherPlatform.X11((seconds,args)->{
+                if(args[0].equals("wmctrl")&&args[1].equals("-l"))return "0x00000201 0 0 pc The Lord of the Rings Online\n0x00000202 0 0 pc The Lord of the Rings Online\n";
+                if(args[0].equals("xprop"))return "WM_CLASS(STRING) = \"wine\"\n";
+                if(args[1].equals("getactivewindow"))return "514";
+                throw new AssertionError("Unexpected ambiguous window probe");
+            });
+            var candidates=ambiguous.list();
+            check(candidates.size()==2&&candidates.stream().noneMatch(LauncherWindow::recognized),"Unknown Wine/PID metadata still permits manual selection");
+            check(candidates.get(0).id().equals("0x00000202"),"Newest candidate preferred when discovery order is the only hint");
+            check(ambiguous.activeWindowId().equals(candidates.get(0).id()),"Active window picker identifies exact XID");
+            var oldCandidate=new LauncherWindow("0x1",1,"LOTRO","old",false,100);
+            var newCandidate=new LauncherWindow("0x2",2,"LOTRO","new",false,200);
+            check(LauncherWindow.ranked(List.of(newCandidate,oldCandidate)).get(0).sameInstance(newCandidate),
+                    "Newest process preferred to enumeration order");
+            check(!newCandidate.sameInstance(new LauncherWindow("0x2",2,"LOTRO","reused",false,300)),
+                    "Reused window identity requires new verification");
+            X11Backend ordinaryGames=new X11Backend((seconds,args)->{
+                if(args[0].equals("wmctrl"))return new ProcessTools.Result(0,
+                        "0x00000101 0 "+pid+" pc The Lord of the Rings Online\n0x00000102 0 "+pid+" pc The Lord of the Rings Online\n");
+                if(args[0].equals("xprop"))return new ProcessTools.Result(0,"WM_CLASS(STRING) = \""+
+                        (args[2].equals("0x00000101")?"lotrolauncher.exe":"lotroclient64.exe")+"\"");
+                if(args[1].equals("getwindowname"))return new ProcessTools.Result(0,"The Lord of the Rings Online");
+                throw new AssertionError("Unexpected game-window probe");
+            });
+            check(ordinaryGames.listWindows().size()==1&&ordinaryGames.listWindows().get(0).id().equals("0x00000102"),
+                    "Normal game registration excludes a same-title launcher");
+            check(!ordinaryGames.isValidWindow(new GameWindow("0x00000101","The Lord of the Rings Online")),
+                    "No ordinary game chat into verified launcher");
+            check(x11.focus(discovered.get(0)).equals(new java.awt.Rectangle(10,20,720,560)),"Launcher geometry/focus verified");
+            focused[0]=0x102;
+            expectFailure(()->x11.foreground(discovered.get(0)),"Wrong foreground launcher rejected");
+            var windows=new LauncherPlatform.Windows((seconds,args)->"12345|2345|67890|LotroLauncher|The Lord of the Rings Online");
+            check(windows.list().size()==1&&windows.list().get(0).pid()==2345,"Windows launcher discovery retains HWND, PID and instance");
+            expectFailure(()->windows.foreground(windows.list().get(0)),"Windows invalid foreground response stops");
+            var ambiguousWindows=new LauncherPlatform.Windows((seconds,args)->"12345|2345|67890|lotroclient64|The Lord of the Rings Online");
+            check(ambiguousWindows.list().size()==1&&!ambiguousWindows.list().get(0).recognized(),"Windows same-title manual candidates available");
+            var activeWindows=new LauncherPlatform.Windows((seconds,args)->"12345|2345");
+            check(activeWindows.activeWindowId().equals("12345"),"Active window picker identifies exact HWND");
+
+            // Render small distinct marker patches, not real launcher imagery.
+            java.awt.Rectangle bounds=new java.awt.Rectangle(10,20,720,560);
+            java.awt.Rectangle userArea=new java.awt.Rectangle(20,20,24,12);
+            java.awt.Rectangle passArea=new java.awt.Rectangle(20,50,24,12);
+            java.awt.Rectangle worldArea=new java.awt.Rectangle(80,20,24,12);
+            class Simulation implements LauncherPlatform,LauncherLogin.Desktop{
+                final LauncherWindow w=new LauncherWindow("0x1",1,"Mock LOTRO launcher","mock-instance");
+                final List<String> input=new ArrayList<>();
+                boolean login=true;int enters=0,steals=0,focusCalls=0,failAtChar=-1,chars=0;
+                public List<LauncherWindow> list(){return List.of(w);}
+                public java.awt.Rectangle focus(LauncherWindow target){focusCalls++;return new java.awt.Rectangle(bounds);}
+                public java.awt.Rectangle foreground(LauncherWindow target)throws IOException{
+                    if(steals>0){steals--;throw new IOException("New game window stole focus");}
+                    return new java.awt.Rectangle(bounds);
+                }
+                public Guard guard(LauncherWindow target){return ()->{if(failAtChar>=0&&chars>=failAtChar)throw new IOException("Focus lost");};}
+                public void start(Path p){throw new AssertionError("No real script");}
+                public java.awt.image.BufferedImage capture(java.awt.Rectangle r){
+                    var im=new java.awt.image.BufferedImage(r.width,r.height,java.awt.image.BufferedImage.TYPE_INT_RGB);
+                    if(r.width==14&&r.height==6&&login){
+                        for(int y=0;y<r.height;y++)for(int x=0;x<r.width;x++)im.setRGB(x,y,0xffffff);
+                        return im;
+                    }
+                    int x=r.x-bounds.x;
+                    boolean show=(x==userArea.x&&login)||(x==worldArea.x&&!login);
+                    if(show)for(int y=2;y<r.height-2;y++)for(int px=3;px<r.width-3;px++)if((px+y)%3==0)im.setRGB(px,y,0xffffff);
+                    return im;
+                }
+                public java.awt.Point pointer(){return new java.awt.Point(100,50);}
+                public void click(java.awt.Point p){input.add("click:"+p.x+":"+p.y);}
+                public void clearField(){input.add("clear");}
+                public void type(char c){chars++;input.add("type:"+c);}
+                public void releaseModifiers(){input.add("release");}
+                public void enter(){
+                    input.add("enter");enters++;login=!login;
+                    if(login)steals=2; // two new foreground grabs after launch
+                }
+            }
+            Simulation sim=new Simulation();
+            LauncherLogin.Marker user=LauncherLogin.Marker.capture(sim,bounds,userArea);
+            LauncherLogin.Marker pass=LauncherLogin.Marker.capture(sim,bounds,passArea);
+            sim.login=false;
+            LauncherLogin.Marker world=LauncherLogin.Marker.capture(sim,bounds,worldArea);
+            check(!user.matches(sim,bounds),"Login marker rejects world selection");
+            sim.login=true;
+            check(!world.matches(sim,bounds),"World marker rejects login screen");
+            LauncherLogin.Layout layout=new LauncherLogin.Layout(720,560,new java.awt.Point(100,100),new java.awt.Point(100,150),List.of(user,pass),world);
+            LauncherLayoutStore store=new LauncherLayoutStore(dir.resolve("launcher-layout.bin"));
+            store.save(layout);var loaded=store.load();
+            check(loaded.loginMatches(sim,bounds)&&loaded.world()!=null,"Calibration persists across Conductor sessions");
+            check(!loaded.loginMatches(sim,new java.awt.Rectangle(10,20,800,560)),"Changed launcher size fails calibration check");
+            var timing=new LauncherLogin.Timing(0,0,0,250,5000);
+            var log=new ArrayList<String>();
+            try(var a=new LauncherLogin.Account("A","p1".toCharArray());var b=new LauncherLogin.Account("B","p2".toCharArray())){
+                new LauncherLogin.Flow(sim,sim.w,sim,loaded,timing,()->false,log::add,ms->{}).run(List.of(a,b));
+                check(sim.enters==4&&sim.focusCalls>=6,"Two-enter sequence refocuses launcher across accounts");
+                check(java.util.Collections.frequency(sim.input,"clear")==4,"Username and password cleared for each account");
+                check(sim.input.equals(List.of("release","click:110:120","clear","type:A","click:110:170","clear","type:p","type:1","enter","enter",
+                        "release","click:110:120","clear","type:B","click:110:170","clear","type:p","type:2","enter","enter")),
+                        "Correct field order and exactly two Enter presses per account");
+                check(log.stream().noneMatch(s->s.contains("p1")||s.contains("p2")),"Login progress does not expose game passwords");
+                check(log.stream().filter(s->s.contains("Waiting for verified login page")).count()>=2,"Two focus grabs delay the next credentials");
+
+                Simulation wrong=new Simulation();wrong.login=false;
+                expectFailure(()->new LauncherLogin.Flow(wrong,wrong.w,wrong,loaded,timing,()->false,ignored->{},ms->{}).firstEnter(a),
+                        "Wrong launcher page never receives credentials");
+                check(wrong.input.isEmpty(),"No keys or clicks when login page is unverified");
+                Simulation lost=new Simulation();lost.failAtChar=1;
+                expectFailure(()->new LauncherLogin.Flow(lost,lost.w,lost,loaded,timing,()->false,ignored->{},ms->{}).firstEnter(a),
+                        "Foreground loss aborts credential entry");
+                check(lost.enters==0&&lost.chars==1,"No remaining password characters or Enter after focus loss");
+                Simulation stopped=new Simulation();
+                expectFailure(()->new LauncherLogin.Flow(stopped,stopped.w,stopped,loaded,timing,()->true,ignored->{},ms->{}).firstEnter(a),
+                        "Cancelled login sends nothing");
+                check(stopped.input.isEmpty(),"Stop prevents keyboard input");
+            }
+            KeyTyper.Keys dummyKeys=new KeyTyper.Keys(){public void press(int code){}public void release(int code){}};
+            for(char c=32;c<=126;c++)KeyTyper.type(dummyKeys,c);
+            check(true,"Every printable ASCII password character can be typed");
+        }finally{
+            Arrays.fill(master,'\0');Arrays.fill(secret,'\0');deleteTree(dir);
+        }
+    }
+    private static List<Byte> toByteList(byte[] bytes){
+        List<Byte> list=new ArrayList<>(bytes.length);for(byte b:bytes)list.add(b);return list;
     }
 
     private static void networkAndCommands() throws Exception {

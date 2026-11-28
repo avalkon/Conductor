@@ -26,6 +26,7 @@ public final class SettingsStore {
     private SongDisplayFormat songDisplayFormat = SongDisplayFormat.PARTS_TITLE_ARTIST_TIME;
     private int identifyWaitSeconds = 120;
     private ChatInputTiming chatTiming = ChatInputTiming.DEFAULT;
+    private ChatPastePolicy pastePolicy = ChatPastePolicy.DEFAULT;
 
     public SettingsStore(Path file) throws IOException {
         this.file = file.toAbsolutePath().normalize();
@@ -60,6 +61,12 @@ public final class SettingsStore {
             catch (NumberFormatException ignored) { identifyWaitSeconds = 120; }
             if (identifyWaitSeconds < 15 || identifyWaitSeconds > 600) identifyWaitSeconds = 120;
             try {
+                pastePolicy = new ChatPastePolicy(
+                        Boolean.parseBoolean(props.getProperty("pasteLongChat", "false")),
+                        Integer.parseInt(props.getProperty("pasteThresholdChars", "40")),
+                        Boolean.parseBoolean(props.getProperty("preserveChatClipboard", "true")));
+            } catch (IllegalArgumentException ignored) { pastePolicy = ChatPastePolicy.DEFAULT; }
+            try {
                 chatTiming = new ChatInputTiming(
                     Integer.parseInt(props.getProperty("chatOpenMs", "300")),
                     Integer.parseInt(props.getProperty("chatKeyDelayMs", "45")),
@@ -71,6 +78,12 @@ public final class SettingsStore {
     }
     public Path path() { return file; }
     public ChatInputTiming chatTiming() { return chatTiming; }
+    public ChatPastePolicy pastePolicy() { return pastePolicy; }
+    public void setPastePolicy(ChatPastePolicy value) throws IOException {
+        ChatPastePolicy previous = pastePolicy;
+        pastePolicy = java.util.Objects.requireNonNull(value);
+        try { save(); } catch(IOException e) { pastePolicy = previous; throw e; }
+    }
     public void setChatTiming(ChatInputTiming value) throws IOException {
         ChatInputTiming previous = chatTiming;
         chatTiming = java.util.Objects.requireNonNull(value);
@@ -165,6 +178,9 @@ public final class SettingsStore {
         p.setProperty("songBookLibraryFile", songBookLibraryFile);
         p.setProperty("songDisplayFormat",songDisplayFormat.name());
         p.setProperty("identifyWaitSeconds", Integer.toString(identifyWaitSeconds));
+        p.setProperty("pasteLongChat", Boolean.toString(pastePolicy.enabled()));
+        p.setProperty("pasteThresholdChars", Integer.toString(pastePolicy.minimumCharacters()));
+        p.setProperty("preserveChatClipboard", Boolean.toString(pastePolicy.preserveClipboard()));
         p.setProperty("chatOpenMs", Integer.toString(chatTiming.chatOpenMs()));
         p.setProperty("chatKeyDelayMs", Integer.toString(chatTiming.keyDelayMs()));
         p.setProperty("chatBeforeEnterMs", Integer.toString(chatTiming.beforeEnterMs()));
